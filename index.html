@@ -93,7 +93,7 @@ var srcTxt=document.getElementById('srcTxt'), transTxt=document.getElementById('
     recTgl=document.getElementById('recTgl'),
     srcPane=document.getElementById('srcPane'), exportBar=document.getElementById('exportBar');
 
-var V='v7';                    // 画面表示用バージョン（キャッシュ確認用）
+var V='v8';                    // 画面表示用バージョン（キャッシュ確認用）
 var diagBuf=[];                // 診断ログ（セッション・エラー・再起動の時系列）
 function diag(m){
   var d=new Date();
@@ -565,20 +565,14 @@ transTgl.addEventListener('change',function(){
   transPane.style.display=this.checked?'':'none';
 });
 
-/* オンデバイス認識（対応 Chrome のみ）: サーバー側のクールダウンと無関係になり安定する */
+/* オンデバイス認識の探索は「ログに記録するだけ」。v7 で自動有効化したところ
+   認識が全滅したため、実挙動を検証するまで有効化はしない（localASR は常に false のまま） */
 if(SR){
   ['ja-JP','en-US'].forEach(function(lc){
     try{
       if(typeof SR.available==='function'){
         SR.available({langs:[lc],processLocally:true}).then(function(st){
-          diag('local '+lc+': '+st);
-          if(st==='available'){localASR[lc]=true;}
-          else if(st==='downloadable' && typeof SR.install==='function'){
-            SR.install({langs:[lc],processLocally:true}).then(function(ok){
-              diag('local install '+lc+': '+ok);
-              if(ok)localASR[lc]=true;
-            }).catch(function(){});
-          }
+          diag('local '+lc+': '+st+' (not used)');
         }).catch(function(){});
       }else{
         diag('local API none');
