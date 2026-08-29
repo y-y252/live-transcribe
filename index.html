@@ -17,16 +17,24 @@ h1{font-size:15px;margin:0;flex:1;font-weight:700;white-space:nowrap}
 .seg button.on{background:#0a84ff;color:#fff}
 .tgl{display:flex;align-items:center;gap:4px;font-size:12px;color:#3a3a3c;flex:none}
 main{flex:1;display:flex;flex-direction:column;gap:8px;padding:8px;min-height:0}
-.pane{flex:1;min-height:0;display:flex;flex-direction:column;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.pane{flex:1;min-height:0;display:flex;flex-direction:column;background:#fff;border-radius:12px;overflow:hidden;
+  box-shadow:0 1px 3px rgba(0,0,0,.06);position:relative}
 .pane .cap{flex:none;font-size:11px;font-weight:700;color:#8e8e93;letter-spacing:.06em;padding:8px 12px 0}
 .pane .txt{flex:1;overflow-y:auto;padding:6px 12px 12px;font-size:21px;line-height:1.45;white-space:pre-wrap;word-break:break-word;
   -webkit-user-select:text;user-select:text;-webkit-overflow-scrolling:touch}
 #transPane .txt{font-size:19px;color:#3c3c43}
 .interim{color:#98989f}
-footer{flex:none;padding:8px 12px calc(10px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #e3e3e8;
-  display:flex;gap:8px;align-items:center}
+.jump{position:absolute;right:10px;bottom:10px;border:0;border-radius:999px;background:#0a84ff;color:#fff;
+  font-size:13px;font-weight:700;padding:9px 14px;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+.jump.hid{display:none}
+footer{flex:none;display:flex;flex-direction:column;gap:8px;padding:8px 12px calc(10px + env(safe-area-inset-bottom));
+  background:#fff;border-top:1px solid #e3e3e8}
+#exportBar{display:flex;gap:8px}
+#exportBar[hidden]{display:none}
+.frow{display:flex;gap:8px;align-items:center}
 #status{flex:1;font-size:12px;color:#8e8e93;min-width:0}
 button.act{border:0;border-radius:10px;font-size:15px;font-weight:700;padding:12px 14px;flex:none}
+button.act.sm{flex:1;font-size:13px;padding:10px 8px;background:#e5e5ea;color:#1c1c1e}
 #mainBtn{background:#0a84ff;color:#fff;min-width:110px}
 body.rec #mainBtn{background:#ff3b30}
 #copyBtn,#clearBtn{background:#e5e5ea;color:#1c1c1e;font-size:13px}
@@ -49,17 +57,26 @@ body.rec .dot{visibility:visible}
   <div class="pane" id="srcPane">
     <div class="cap">原文</div>
     <div class="txt" id="srcTxt"></div>
+    <button class="jump hid" id="srcJump" type="button">↓ 最新へ</button>
   </div>
   <div class="pane" id="transPane">
     <div class="cap">翻訳</div>
     <div class="txt" id="transTxt"></div>
+    <button class="jump hid" id="trJump" type="button">↓ 最新へ</button>
   </div>
 </main>
 <footer>
-  <div id="status">「開始」を押してください（初回はマイク許可が出ます）</div>
-  <button class="act" id="clearBtn" type="button">消去</button>
-  <button class="act" id="copyBtn" type="button">コピー</button>
-  <button class="act" id="mainBtn" type="button">開始</button>
+  <div id="exportBar" hidden>
+    <button class="act sm" id="expAudio" type="button">音声 (.m4a)</button>
+    <button class="act sm" id="expSrc" type="button">原文 (.vtt)</button>
+    <button class="act sm" id="expTr" type="button">翻訳 (.vtt)</button>
+  </div>
+  <div class="frow">
+    <div id="status">「開始」を押してください（初回はマイク許可が出ます）</div>
+    <button class="act" id="clearBtn" type="button">消去</button>
+    <button class="act" id="copyBtn" type="button">コピー</button>
+    <button class="act" id="mainBtn" type="button">開始</button>
+  </div>
 </footer>
 <script>
 (function(){
@@ -68,17 +85,24 @@ var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 var srcTxt=document.getElementById('srcTxt'), transTxt=document.getElementById('transTxt'),
     mainBtn=document.getElementById('mainBtn'), statusEl=document.getElementById('status'),
     jaBtn=document.getElementById('langJa'), enBtn=document.getElementById('langEn'),
-    transTgl=document.getElementById('transTgl'), transPane=document.getElementById('transPane');
+    transTgl=document.getElementById('transTgl'), transPane=document.getElementById('transPane'),
+    srcPane=document.getElementById('srcPane'), exportBar=document.getElementById('exportBar');
 
 var lang='ja';                 // 'ja' | 'en'（入力言語）
 var running=false, rec=null, restartTimer=null;
-var committed='';              // 確定済みテキスト（過去セッション分）
-var sessionFinal='', interim=''; // 現セッションの確定分・暫定分
-var doneLen=0;                 // sessionFinal のうち翻訳キュー投入済みの長さ
+var committed='', sessionFinal='', interim='';
+var doneLen=0;                 // sessionFinal のうち確定チャンク化済みの長さ
 var transDone='', transInterim='';
 var tChain=Promise.resolve();  // 翻訳の順序保証キュー
 var interimTimer=null, transErrShown=false;
 var wl=null;
+
+/* 確定セグメント（タイムスタンプ付き・VTT用） */
+var segs=[];                   // {t0,t1,src,tr}
+var takeStart=0, prevDur=0;    // 累積経過秒の管理
+
+/* 録音 */
+var mediaStream=null, recorder=null, audioChunks=[], audioMime='audio/mp4';
 
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function joiner(){return lang==='en' ? ' ' : '';}
@@ -88,50 +112,67 @@ function fullText(){
   return t.trim();
 }
 function setStatus(t){statusEl.textContent=t;}
+function elapsedSec(){return prevDur + (takeStart? (Date.now()-takeStart)/1000 : 0);}
+
+/* ---- スクロール追従（遡り中は固定・「最新へ」で復帰） ---- */
+function makeFollow(el,btn){
+  var st={on:true};
+  el.addEventListener('scroll',function(){
+    var atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if(atBottom){ st.on=true; btn.classList.add('hid'); }
+    else { st.on=false; btn.classList.remove('hid'); }
+  });
+  btn.addEventListener('click',function(){
+    st.on=true; el.scrollTop=el.scrollHeight; btn.classList.add('hid');
+  });
+  return st;
+}
+var fSrc=makeFollow(srcTxt,document.getElementById('srcJump'));
+var fTr =makeFollow(transTxt,document.getElementById('trJump'));
+
 function render(){
   srcTxt.innerHTML = esc(committed+sessionFinal) +
     (interim ? '<span class="interim">'+esc(joiner()+interim)+'</span>' : '');
-  srcTxt.scrollTop = srcTxt.scrollHeight;
+  if(fSrc.on) srcTxt.scrollTop = srcTxt.scrollHeight;
   transTxt.innerHTML = esc(transDone) +
     (transInterim ? '<span class="interim"> '+esc(transInterim)+'</span>' : '');
-  transTxt.scrollTop = transTxt.scrollHeight;
+  if(fTr.on) transTxt.scrollTop = transTxt.scrollHeight;
 }
 function refreshUI(){
   document.body.classList.toggle('rec',running);
   mainBtn.textContent = running ? '停止' : '開始';
+  exportBar.hidden = running || (segs.length===0 && audioChunks.length===0);
 }
 
 /* ---- 翻訳（Google 翻訳の非公式エンドポイント・キー不要） ---- */
 function transEnabled(){return transTgl.checked;}
-function translateReq(text){
-  var sl=lang, tl=(lang==='ja')?'en':'ja';
+function translateReq(text,sl){
+  var tl=(sl==='ja')?'en':'ja';
   var u='https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl='+sl+'&tl='+tl+'&q='+encodeURIComponent(text);
   return fetch(u).then(function(r){if(!r.ok)throw new Error('http');return r.json();})
     .then(function(j){return (j[0]||[]).map(function(x){return (x&&x[0])||'';}).join('');});
 }
-function queueFinalTranslation(){
-  if(!transEnabled())return;
-  var chunk=sessionFinal.slice(doneLen);
-  if(!chunk.trim())return;
-  doneLen=sessionFinal.length;
-  transInterim='';
-  tChain=tChain.then(function(){
-    return translateReq(chunk).then(function(t){
-      transDone += (transDone && !/\s$/.test(transDone) ? ' ' : '') + t;
-      transErrShown=false; render();
-    }).catch(function(){
-      if(!transErrShown){transErrShown=true;setStatus('翻訳サーバーに接続できません（文字起こしは継続中）');}
+
+/* 確定テキストを1チャンク登録（VTTセグメント化＋翻訳キュー投入） */
+function addFinalChunk(text){
+  var trimmed=text.trim();
+  if(!trimmed)return;
+  var now=elapsedSec();
+  var seg={t0:(segs.length?segs[segs.length-1].t1:0), t1:now, src:trimmed, tr:''};
+  segs.push(seg);
+  if(transEnabled()){
+    var sl=lang;
+    transInterim='';
+    tChain=tChain.then(function(){
+      return translateReq(trimmed,sl).then(function(t){
+        seg.tr=t;
+        transDone += (transDone && !/\s$/.test(transDone) ? ' ' : '') + t;
+        transErrShown=false; render();
+      }).catch(function(){
+        if(!transErrShown){transErrShown=true;setStatus('翻訳サーバーに接続できません（文字起こしは継続中）');}
+      });
     });
-  });
-}
-function queueTextTranslation(text){
-  if(!transEnabled()||!text.trim())return;
-  tChain=tChain.then(function(){
-    return translateReq(text).then(function(t){
-      transDone += (transDone && !/\s$/.test(transDone) ? ' ' : '') + t;
-      transInterim=''; render();
-    }).catch(function(){});
-  });
+  }
 }
 function scheduleInterimTranslation(){
   if(!transEnabled())return;
@@ -139,7 +180,7 @@ function scheduleInterimTranslation(){
   interimTimer=setTimeout(function(){
     var t=interim;
     if(!t.trim()){transInterim='';render();return;}
-    translateReq(t).then(function(x){
+    translateReq(t,lang).then(function(x){
       if(interim && (interim===t || interim.indexOf(t)===0 || t.indexOf(interim)===0)){
         transInterim=x; render();
       }
@@ -160,35 +201,102 @@ function startSession(){
       if(r.isFinal) f+=r[0].transcript; else it+=r[0].transcript;
     }
     sessionFinal=f; interim=it;
-    if(sessionFinal.length>doneLen) queueFinalTranslation();
+    if(sessionFinal.length>doneLen){
+      var chunk=sessionFinal.slice(doneLen);
+      doneLen=sessionFinal.length;
+      addFinalChunk(chunk);
+    }
     render();
     scheduleInterimTranslation();
   };
   rec.onerror=function(e){
     if(e.error==='not-allowed'||e.error==='service-not-allowed'){
-      running=false; refreshUI(); keepAwake(false);
+      running=false; refreshUI(); keepAwake(false); stopRecording();
       setStatus('マイク/音声認識が許可されていません。設定 > Safari > マイク を確認してください');
     }
   };
   rec.onend=function(){
-    queueFinalTranslation();
+    // 確定分の残りをセグメント化
+    if(sessionFinal.length>doneLen){
+      addFinalChunk(sessionFinal.slice(doneLen));
+      doneLen=sessionFinal.length;
+    }
     if(sessionFinal){committed+=sessionFinal+joiner();sessionFinal='';doneLen=0;}
-    if(running){
+    // 取りこぼし防止: セッションが区切られた時点の暫定テキストは捨てずに確定へ格上げする
+    if(interim){
+      committed+=joiner()+interim;
+      addFinalChunk(interim);
       interim='';
-      restartTimer=setTimeout(function(){try{startSession();}catch(e){}},250);
+    }
+    if(running){
+      restartTimer=setTimeout(function(){try{startSession();}catch(e){}},120);
     }else{
-      if(interim){
-        var last=interim;
-        committed+=joiner()+last;
-        interim='';
-        queueTextTranslation(last);
-      }
       transInterim='';
       refreshUI();
     }
     render();
   };
   try{rec.start();}catch(e){}
+}
+
+/* ---- 録音（書き出し用。失敗しても文字起こしは継続） ---- */
+function startRecording(){
+  if(!navigator.mediaDevices||!window.MediaRecorder)return;
+  navigator.mediaDevices.getUserMedia({audio:true}).then(function(s){
+    mediaStream=s;
+    var mime='';
+    if(MediaRecorder.isTypeSupported){
+      if(MediaRecorder.isTypeSupported('audio/mp4'))mime='audio/mp4';
+      else if(MediaRecorder.isTypeSupported('audio/webm'))mime='audio/webm';
+    }
+    try{recorder=mime?new MediaRecorder(s,{mimeType:mime}):new MediaRecorder(s);}
+    catch(e){recorder=new MediaRecorder(s);}
+    audioMime=recorder.mimeType||mime||'audio/mp4';
+    audioChunks=[];
+    recorder.ondataavailable=function(ev){if(ev.data&&ev.data.size)audioChunks.push(ev.data);};
+    recorder.start(1000);
+  }).catch(function(){
+    setStatus('録音は開始できませんでした（文字起こしは動作します）');
+  });
+}
+function stopRecording(){
+  try{if(recorder&&recorder.state!=='inactive')recorder.stop();}catch(e){}
+  if(mediaStream){mediaStream.getTracks().forEach(function(t){t.stop();});mediaStream=null;}
+  recorder=null;
+}
+
+/* ---- 書き出し ---- */
+function pad(n){return (n<10?'0':'')+n;}
+function fmtTs(s){
+  if(!(s>0))s=0;
+  var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;
+  return pad(h)+':'+pad(m)+':'+(sec<10?'0':'')+sec.toFixed(3);
+}
+function stamp(){
+  var d=new Date();
+  return 'transcript-'+d.getFullYear()+pad(d.getMonth()+1)+pad(d.getDate())+'-'+pad(d.getHours())+pad(d.getMinutes());
+}
+function dl(blob,name){
+  var a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download=name;
+  document.body.appendChild(a); a.click();
+  setTimeout(function(){URL.revokeObjectURL(a.href);a.remove();},2000);
+}
+function exportAudio(){
+  if(!audioChunks.length){setStatus('録音データがありません');return;}
+  var ext = audioMime.indexOf('mp4')>=0 ? 'm4a' : (audioMime.indexOf('webm')>=0?'webm':'audio');
+  dl(new Blob(audioChunks,{type:audioMime}), stamp()+'.'+ext);
+  setStatus('音声を書き出しました');
+}
+function exportVtt(kind){ // 'src' | 'tr'
+  var list=segs.filter(function(g){return kind==='src'? !!g.src : !!g.tr;});
+  if(!list.length){setStatus(kind==='src'?'書き出すテキストがありません':'翻訳データがありません');return;}
+  var out='WEBVTT\n\n';
+  list.forEach(function(g,i){
+    out += (i+1)+'\n'+fmtTs(g.t0)+' --> '+fmtTs(g.t1)+'\n'+(kind==='src'?g.src:g.tr).trim()+'\n\n';
+  });
+  dl(new Blob([out],{type:'text/vtt'}), stamp()+(kind==='src'?'-src':'-translated')+'.vtt');
+  setStatus(kind==='src'?'原文を書き出しました':'翻訳を書き出しました');
 }
 
 /* ---- クリップボード ---- */
@@ -209,6 +317,27 @@ function copyNow(){
   }else fb();
 }
 
+/* ---- 全選択（Ctrl/Cmd+A）をボックス単位に ---- */
+var lastPane=srcTxt;
+srcPane.addEventListener('pointerdown',function(){lastPane=srcTxt;});
+transPane.addEventListener('pointerdown',function(){lastPane=transTxt;});
+document.addEventListener('keydown',function(e){
+  if((e.metaKey||e.ctrlKey) && (e.key==='a'||e.key==='A')){
+    var target=lastPane;
+    var sel=window.getSelection();
+    if(sel && sel.anchorNode){
+      if(srcTxt.contains(sel.anchorNode)) target=srcTxt;
+      else if(transTxt.contains(sel.anchorNode)) target=transTxt;
+    }
+    if(target===transTxt && transPane.style.display==='none') target=srcTxt;
+    e.preventDefault();
+    var r=document.createRange();
+    r.selectNodeContents(target);
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+});
+
 /* ---- 画面スリープ防止 ---- */
 function keepAwake(on){
   if(!('wakeLock' in navigator))return;
@@ -226,26 +355,36 @@ document.addEventListener('visibilitychange',function(){
 mainBtn.addEventListener('click',function(){
   if(!SR){setStatus('このブラウザは音声認識に未対応です。iPhone の Safari で開いてください');return;}
   if(running){
-    copyNow();                      // 停止タップと同時に全文をコピー（タップ操作中なので許可される）
+    copyNow();                      // 停止タップと同時に全文をコピー
     running=false;
     clearTimeout(restartTimer);
     try{rec&&rec.stop();}catch(e){}
+    stopRecording();
+    prevDur=elapsedSec(); takeStart=0;
     keepAwake(false);
     refreshUI();
   }else{
     running=true;
+    if(segs.length===0)prevDur=0;
+    takeStart=Date.now();
+    startRecording();               // 注意: 再開すると録音音声は新しいテイクに置き換わる
     setStatus('聞き取り中…');
     keepAwake(true);
     refreshUI();
-    startSession();
+    setTimeout(startSession,300);   // 録音と認識の同時起動の相性対策で認識をわずかに遅らせる
   }
 });
 document.getElementById('copyBtn').addEventListener('click',copyNow);
 document.getElementById('clearBtn').addEventListener('click',function(){
   committed=sessionFinal=interim=transDone=transInterim='';
-  doneLen=0; render();
+  doneLen=0; segs=[]; audioChunks=[]; prevDur=0; takeStart=running?Date.now():0;
+  render(); refreshUI();
   setStatus('消去しました');
 });
+document.getElementById('expAudio').addEventListener('click',exportAudio);
+document.getElementById('expSrc').addEventListener('click',function(){exportVtt('src');});
+document.getElementById('expTr').addEventListener('click',function(){exportVtt('tr');});
+
 function setLang(l){
   if(lang===l)return;
   lang=l;
@@ -262,6 +401,7 @@ transTgl.addEventListener('change',function(){
 
 if(!SR){setStatus('このブラウザは音声認識に未対応です。iPhone の Safari で開いてください');}
 render();
+refreshUI();
 })();
 </script>
 </body>
