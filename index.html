@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta name="format-detection" content="telephone=no">
+<title>ライブ文字起こし</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Helvetica Neue",sans-serif;
+  background:#f2f2f7;color:#1c1c1e;display:flex;flex-direction:column;height:100dvh;overflow:hidden}
+header{flex:none;display:flex;align-items:center;gap:8px;padding:10px 12px;background:#fff;border-bottom:1px solid #e3e3e8}
+h1{font-size:15px;margin:0;flex:1;font-weight:700;white-space:nowrap}
+.seg{display:flex;border:1px solid #0a84ff;border-radius:8px;overflow:hidden;flex:none}
+.seg button{border:0;background:#fff;color:#0a84ff;font-size:13px;padding:6px 10px;font-weight:600}
+.seg button.on{background:#0a84ff;color:#fff}
+.tgl{display:flex;align-items:center;gap:4px;font-size:12px;color:#3a3a3c;flex:none}
+main{flex:1;display:flex;flex-direction:column;gap:8px;padding:8px;min-height:0}
+.pane{flex:1;min-height:0;display:flex;flex-direction:column;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.pane .cap{flex:none;font-size:11px;font-weight:700;color:#8e8e93;letter-spacing:.06em;padding:8px 12px 0}
+.pane .txt{flex:1;overflow-y:auto;padding:6px 12px 12px;font-size:21px;line-height:1.45;white-space:pre-wrap;word-break:break-word;
+  -webkit-user-select:text;user-select:text;-webkit-overflow-scrolling:touch}
+#transPane .txt{font-size:19px;color:#3c3c43}
+.interim{color:#98989f}
+footer{flex:none;padding:8px 12px calc(10px + env(safe-area-inset-bottom));background:#fff;border-top:1px solid #e3e3e8;
+  display:flex;gap:8px;align-items:center}
+#status{flex:1;font-size:12px;color:#8e8e93;min-width:0}
+button.act{border:0;border-radius:10px;font-size:15px;font-weight:700;padding:12px 14px;flex:none}
+#mainBtn{background:#0a84ff;color:#fff;min-width:110px}
+body.rec #mainBtn{background:#ff3b30}
+#copyBtn,#clearBtn{background:#e5e5ea;color:#1c1c1e;font-size:13px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#ff3b30;margin-right:5px;vertical-align:1px;
+  animation:blink 1s infinite;visibility:hidden}
+body.rec .dot{visibility:visible}
+@keyframes blink{50%{opacity:.2}}
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="dot"></span>ライブ文字起こし</h1>
+  <div class="seg">
+    <button id="langJa" class="on" type="button">日本語</button>
+    <button id="langEn" type="button">English</button>
+  </div>
+  <label class="tgl"><input type="checkbox" id="transTgl" checked>翻訳</label>
+</header>
+<main>
+  <div class="pane" id="srcPane">
+    <div class="cap">原文</div>
+    <div class="txt" id="srcTxt"></div>
+  </div>
+  <div class="pane" id="transPane">
+    <div class="cap">翻訳</div>
+    <div class="txt" id="transTxt"></div>
+  </div>
+</main>
+<footer>
+  <div id="status">「開始」を押してください（初回はマイク許可が出ます）</div>
+  <button class="act" id="clearBtn" type="button">消去</button>
+  <button class="act" id="copyBtn" type="button">コピー</button>
+  <button class="act" id="mainBtn" type="button">開始</button>
+</footer>
+<script>
+(function(){
+'use strict';
+var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+var srcTxt=document.getElementById('srcTxt'), transTxt=document.getElementById('transTxt'),
+    mainBtn=document.getElementById('mainBtn'), statusEl=document.getElementById('status'),
+    jaBtn=document.getElementById('langJa'), enBtn=document.getElementById('langEn'),
+    transTgl=document.getElementById('transTgl'), transPane=document.getElementById('transPane');
+
+var lang='ja';                 // 'ja' | 'en'（入力言語）
+var running=false, rec=null, restartTimer=null;
+var committed='';              // 確定済みテキスト（過去セッション分）
+var sessionFinal='', interim=''; // 現セッションの確定分・暫定分
+var doneLen=0;                 // sessionFinal のうち翻訳キュー投入済みの長さ
+var transDone='', transInterim='';
+var tChain=Promise.resolve();  // 翻訳の順序保証キュー
+var interimTimer=null, transErrShown=false;
+var wl=null;
+
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function joiner(){return lang==='en' ? ' ' : '';}
+function fullText(){
+  var t=committed+sessionFinal;
+  if(interim) t+=joiner()+interim;
+  return t.trim();
+}
+function setStatus(t){statusEl.textContent=t;}
+function render(){
+  srcTxt.innerHTML = esc(committed+sessionFinal) +
+    (interim ? '<span class="interim">'+esc(joiner()+interim)+'</span>' : '');
+  srcTxt.scrollTop = srcTxt.scrollHeight;
+  transTxt.innerHTML = esc(transDone) +
+    (transInterim ? '<span class="interim"> '+esc(transInterim)+'</span>' : '');
+  transTxt.scrollTop = transTxt.scrollHeight;
+}
+function refreshUI(){
+  document.body.classList.toggle('rec',running);
+  mainBtn.textContent = running ? '停止' : '開始';
+}
+
+/* ---- 翻訳（Google 翻訳の非公式エンドポイント・キー不要） ---- */
+function transEnabled(){return transTgl.checked;}
+function translateReq(text){
+  var sl=lang, tl=(lang==='ja')?'en':'ja';
+  var u='https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl='+sl+'&tl='+tl+'&q='+encodeURIComponent(text);
+  return fetch(u).then(function(r){if(!r.ok)throw new Error('http');return r.json();})
+    .then(function(j){return (j[0]||[]).map(function(x){return (x&&x[0])||'';}).join('');});
+}
+function queueFinalTranslation(){
+  if(!transEnabled())return;
+  var chunk=sessionFinal.slice(doneLen);
+  if(!chunk.trim())return;
+  doneLen=sessionFinal.length;
+  transInterim='';
+  tChain=tChain.then(function(){
+    return translateReq(chunk).then(function(t){
+      transDone += (transDone && !/\s$/.test(transDone) ? ' ' : '') + t;
+      transErrShown=false; render();
+    }).catch(function(){
+      if(!transErrShown){transErrShown=true;setStatus('翻訳サーバーに接続できません（文字起こしは継続中）');}
+    });
+  });
+}
+function queueTextTranslation(text){
+  if(!transEnabled()||!text.trim())return;
+  tChain=tChain.then(function(){
+    return translateReq(text).then(function(t){
+      transDone += (transDone && !/\s$/.test(transDone) ? ' ' : '') + t;
+      transInterim=''; render();
+    }).catch(function(){});
+  });
+}
+function scheduleInterimTranslation(){
+  if(!transEnabled())return;
+  clearTimeout(interimTimer);
+  interimTimer=setTimeout(function(){
+    var t=interim;
+    if(!t.trim()){transInterim='';render();return;}
+    translateReq(t).then(function(x){
+      if(interim && (interim===t || interim.indexOf(t)===0 || t.indexOf(interim)===0)){
+        transInterim=x; render();
+      }
+    }).catch(function(){});
+  },500);
+}
+
+/* ---- 音声認識（iOS Safari は無音などで勝手に止まるため自動再開） ---- */
+function startSession(){
+  rec=new SR();
+  rec.lang = (lang==='ja') ? 'ja-JP' : 'en-US';
+  rec.continuous=true;
+  rec.interimResults=true;
+  rec.onresult=function(e){
+    var f='',it='';
+    for(var i=0;i<e.results.length;i++){
+      var r=e.results[i];
+      if(r.isFinal) f+=r[0].transcript; else it+=r[0].transcript;
+    }
+    sessionFinal=f; interim=it;
+    if(sessionFinal.length>doneLen) queueFinalTranslation();
+    render();
+    scheduleInterimTranslation();
+  };
+  rec.onerror=function(e){
+    if(e.error==='not-allowed'||e.error==='service-not-allowed'){
+      running=false; refreshUI(); keepAwake(false);
+      setStatus('マイク/音声認識が許可されていません。設定 > Safari > マイク を確認してください');
+    }
+  };
+  rec.onend=function(){
+    queueFinalTranslation();
+    if(sessionFinal){committed+=sessionFinal+joiner();sessionFinal='';doneLen=0;}
+    if(running){
+      interim='';
+      restartTimer=setTimeout(function(){try{startSession();}catch(e){}},250);
+    }else{
+      if(interim){
+        var last=interim;
+        committed+=joiner()+last;
+        interim='';
+        queueTextTranslation(last);
+      }
+      transInterim='';
+      refreshUI();
+    }
+    render();
+  };
+  try{rec.start();}catch(e){}
+}
+
+/* ---- クリップボード ---- */
+function copyNow(){
+  var t=fullText();
+  if(!t){setStatus('コピーする内容がありません');return;}
+  var done=function(){setStatus('クリップボードにコピーしました（'+t.length+'文字）');};
+  var fb=function(){
+    var ta=document.createElement('textarea');
+    ta.value=t; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try{document.execCommand('copy');done();}
+    catch(e){setStatus('自動コピーに失敗しました。テキストを長押しで選択してください');}
+    document.body.removeChild(ta);
+  };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(done,fb);
+  }else fb();
+}
+
+/* ---- 画面スリープ防止 ---- */
+function keepAwake(on){
+  if(!('wakeLock' in navigator))return;
+  if(on){
+    navigator.wakeLock.request('screen').then(function(w){wl=w;}).catch(function(){});
+  }else if(wl){
+    wl.release().catch(function(){}); wl=null;
+  }
+}
+document.addEventListener('visibilitychange',function(){
+  if(document.visibilityState==='visible'&&running)keepAwake(true);
+});
+
+/* ---- UI ---- */
+mainBtn.addEventListener('click',function(){
+  if(!SR){setStatus('このブラウザは音声認識に未対応です。iPhone の Safari で開いてください');return;}
+  if(running){
+    copyNow();                      // 停止タップと同時に全文をコピー（タップ操作中なので許可される）
+    running=false;
+    clearTimeout(restartTimer);
+    try{rec&&rec.stop();}catch(e){}
+    keepAwake(false);
+    refreshUI();
+  }else{
+    running=true;
+    setStatus('聞き取り中…');
+    keepAwake(true);
+    refreshUI();
+    startSession();
+  }
+});
+document.getElementById('copyBtn').addEventListener('click',copyNow);
+document.getElementById('clearBtn').addEventListener('click',function(){
+  committed=sessionFinal=interim=transDone=transInterim='';
+  doneLen=0; render();
+  setStatus('消去しました');
+});
+function setLang(l){
+  if(lang===l)return;
+  lang=l;
+  jaBtn.classList.toggle('on',l==='ja');
+  enBtn.classList.toggle('on',l==='en');
+  setStatus(l==='ja'?'入力言語：日本語 → 英語に翻訳':'入力言語：English → 日本語に翻訳');
+  if(running){try{rec.stop();}catch(e){}}   // onend が新しい言語で再開する
+}
+jaBtn.addEventListener('click',function(){setLang('ja');});
+enBtn.addEventListener('click',function(){setLang('en');});
+transTgl.addEventListener('change',function(){
+  transPane.style.display=this.checked?'':'none';
+});
+
+if(!SR){setStatus('このブラウザは音声認識に未対応です。iPhone の Safari で開いてください');}
+render();
+})();
+</script>
+</body>
+</html>
