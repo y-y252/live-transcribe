@@ -93,7 +93,8 @@ var srcTxt=document.getElementById('srcTxt'), transTxt=document.getElementById('
     recTgl=document.getElementById('recTgl'),
     srcPane=document.getElementById('srcPane'), exportBar=document.getElementById('exportBar');
 
-var V='v8';                    // 画面表示用バージョン（キャッシュ確認用）
+var V='v9';                    // 画面表示用バージョン（キャッシュ確認用）
+var everStarted=false;         // 一度でも開始したか（ログボタン表示用）
 var diagBuf=[];                // 診断ログ（セッション・エラー・再起動の時系列）
 function diag(m){
   var d=new Date();
@@ -157,7 +158,7 @@ function render(){
 function refreshUI(){
   document.body.classList.toggle('rec',running);
   mainBtn.textContent = running ? '停止' : '開始';
-  exportBar.hidden = running || (segs.length===0 && audioChunks.length===0);
+  exportBar.hidden = running || (!everStarted && segs.length===0 && audioChunks.length===0);
   recTgl.disabled = running;   // 録音のON/OFFは開始前に切り替える
 }
 
@@ -514,6 +515,7 @@ mainBtn.addEventListener('click',function(){
     refreshUI();
   }else{
     running=true;
+    everStarted=true;
     if(segs.length===0)prevDur=0;
     takeStart=Date.now();
     setStatus('聞き取り中…');
@@ -581,6 +583,7 @@ if(SR){
   });
 }
 document.getElementById('ver').textContent=V;
+try{window.__diag=diagBuf; window.__ver=V;}catch(e){}   // リモート診断用の読み取り窓
 if(!SR){setStatus('このブラウザは音声認識に未対応です。iPhone の Safari で開いてください');}
 else{setStatus('「開始」を押してください（'+V+'）');}
 render();
