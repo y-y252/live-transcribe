@@ -213,6 +213,8 @@ function isReset(prev,next){
   if(x.indexOf(y)===0||y.indexOf(x)===0)return false;   // 前方一致 → 伸長・縮退であり破棄ではない
   if(x.length<6)return false;                            // 短い文の揺れは修正扱い
   if(y.length >= x.length*0.55)return false;             // 長さが近い → 言い直し・かな漢字変換の揺れ
+  if(/^[぀-ヿー、。\s]+$/.test(x) && /[一-鿿]/.test(y) && y.length>=x.length*0.35)
+    return false;                                        // 仮名の文が漢字混じりへ大きく縮んだ → かな漢字変換
   return dice(x,y) < 0.5;                                // 文字の重なりが少ない → 別の文が始まった＝破棄
 }
 /* 破棄されかけた文を確定へ格上げ（エンジンが実際に出力した文字だけ。推測補完はしない） */
