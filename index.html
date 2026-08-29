@@ -46,7 +46,7 @@ body.rec .dot{visibility:visible}
 </head>
 <body>
 <header>
-  <h1><span class="dot"></span>ライブ文字起こし</h1>
+  <h1><span class="dot"></span>ライブ文字起こし <span id="ver" style="font-size:10px;color:#8e8e93;font-weight:400"></span></h1>
   <div class="seg">
     <button id="langJa" class="on" type="button">日本語</button>
     <button id="langEn" type="button">English</button>
@@ -71,6 +71,7 @@ body.rec .dot{visibility:visible}
     <button class="act sm" id="expAudio" type="button">音声 (.m4a)</button>
     <button class="act sm" id="expSrc" type="button">原文 (.vtt)</button>
     <button class="act sm" id="expTr" type="button">翻訳 (.vtt)</button>
+    <button class="act sm" id="expDiag" type="button">ログ</button>
   </div>
   <div class="frow">
     <div id="status">「開始」を押してください（初回はマイク許可が出ます）</div>
@@ -92,6 +93,14 @@ var srcTxt=document.getElementById('srcTxt'), transTxt=document.getElementById('
     recTgl=document.getElementById('recTgl'),
     srcPane=document.getElementById('srcPane'), exportBar=document.getElementById('exportBar');
 
+var V='v7';                    // 画面表示用バージョン（キャッシュ確認用）
+var diagBuf=[];                // 診断ログ（セッション・エラー・再起動の時系列）
+function diag(m){
+  var d=new Date();
+  diagBuf.push(('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2)+' '+m);
+  if(diagBuf.length>400)diagBuf.shift();
+}
+var localASR={};               // 言語別: オンデバイス認識が使えるか
 var lang='ja';                 // 'ja' | 'en'（入力言語）
 var running=false, rec=null, restartTimer=null;
 var committed='';              // 受理済みの確定テキスト（表示・コピーの本体）
@@ -287,20 +296,28 @@ function startWatchdog(){
     var age=now-sessionStartedAt;
     var quiet=(!interim && idle>1500);
     if(idle>12000 || (age>42000 && quiet) || age>55000){
+      diag('watchdog idle='+(idle/1000).toFixed(1)+'s age='+(age/1000).toFixed(1)+'s');
       forceRestart();   // 死んだ/寿命間近のセッションを待たずに作り直す
     }
   },2000);
 }
 function stopWatchdog(){ if(tick){clearInterval(tick);tick=null;} }
+var sessionHadResult=false, consecFail=0;
 function startSession(){
   rec=new SR();
-  sessionStartedAt=Date.now(); lastResultAt=Date.now();
+  sessionStartedAt=Date.now(); lastResultAt=Date.now(); sessionHadResult=false;
   rec.lang = (lang==='ja') ? 'ja-JP' : 'en-US';
   rec.continuous=true;
   rec.interimResults=true;
+  if(localASR[rec.lang]){try{rec.processLocally=true;}catch(e){}}
+  diag('start '+rec.lang+(localASR[rec.lang]?' [local]':' [network]'));
   doneLen=0; lastGhost='';
   rec.onresult=function(e){
     lastResultAt=Date.now();
+    if(!sessionHadResult){
+      sessionHadResult=true; consecFail=0;
+      diag('first result +'+(Date.now()-sessionStartedAt)+'ms');
+    }
     var f='',it='';
     for(var i=0;i<e.results.length;i++){
       var r=e.results[i];
@@ -334,16 +351,24 @@ function startSession(){
     scheduleInterimTranslation();
   };
   rec.onerror=function(e){
+    diag('error '+e.error);
     if(e.error==='not-allowed'||e.error==='service-not-allowed'){
       running=false; refreshUI(); keepAwake(false); stopRecording();
       setStatus('マイク/音声認識が許可されていません。設定 > Safari > マイク を確認してください');
     }
   };
   rec.onend=function(){
+    diag('end age='+((Date.now()-sessionStartedAt)/1000).toFixed(1)+'s'+(sessionHadResult?'':' (no result)'));
     if(interim){ salvage(interim); interim=''; } // セッション終了時の暫定分も温存
     doneLen=0;
     if(running){
-      restartTimer=setTimeout(function(){try{startSession();}catch(e){}},120);
+      var delay=120;
+      if(!sessionHadResult){                     // 結果ゼロで即死 → サービス拒否の可能性。間隔を空けて再試行
+        consecFail++;
+        delay=Math.min(8000, 250*Math.pow(2,consecFail));
+        diag('backoff '+delay+'ms (fail x'+consecFail+')');
+      }
+      restartTimer=setTimeout(function(){try{startSession();}catch(e){}},delay);
     }else{
       transInterim='';
       refreshUI();
@@ -374,6 +399,7 @@ function startRecording(){
     try{recorder=mime?new MediaRecorder(s,{mimeType:mime}):new MediaRecorder(s);}
     catch(e){recorder=new MediaRecorder(s);}
     audioMime=recorder.mimeType||mime||'audio/mp4';
+    diag('recording on ('+audioMime+')');
     audioChunks=[];
     recorder.ondataavailable=function(ev){if(ev.data&&ev.data.size)audioChunks.push(ev.data);};
     recorder.start(1000);
@@ -511,6 +537,17 @@ document.getElementById('clearBtn').addEventListener('click',function(){
   setStatus('消去しました');
 });
 document.getElementById('expAudio').addEventListener('click',exportAudio);
+document.getElementById('expDiag').addEventListener('click',function(){
+  var t='live-transcribe '+V+' 診断ログ\n'+diagBuf.join('\n');
+  var done=function(){setStatus('診断ログをコピーしました（'+diagBuf.length+'行）');};
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(done,function(){});}
+  else{
+    var ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';
+    document.body.appendChild(ta);ta.select();
+    try{document.execCommand('copy');done();}catch(e){}
+    document.body.removeChild(ta);
+  }
+});
 document.getElementById('expSrc').addEventListener('click',function(){exportVtt('src');});
 document.getElementById('expTr').addEventListener('click',function(){exportVtt('tr');});
 
@@ -528,7 +565,30 @@ transTgl.addEventListener('change',function(){
   transPane.style.display=this.checked?'':'none';
 });
 
+/* オンデバイス認識（対応 Chrome のみ）: サーバー側のクールダウンと無関係になり安定する */
+if(SR){
+  ['ja-JP','en-US'].forEach(function(lc){
+    try{
+      if(typeof SR.available==='function'){
+        SR.available({langs:[lc],processLocally:true}).then(function(st){
+          diag('local '+lc+': '+st);
+          if(st==='available'){localASR[lc]=true;}
+          else if(st==='downloadable' && typeof SR.install==='function'){
+            SR.install({langs:[lc],processLocally:true}).then(function(ok){
+              diag('local install '+lc+': '+ok);
+              if(ok)localASR[lc]=true;
+            }).catch(function(){});
+          }
+        }).catch(function(){});
+      }else{
+        diag('local API none');
+      }
+    }catch(e){}
+  });
+}
+document.getElementById('ver').textContent=V;
 if(!SR){setStatus('このブラウザは音声認識に未対応です。iPhone の Safari で開いてください');}
+else{setStatus('「開始」を押してください（'+V+'）');}
 render();
 refreshUI();
 })();
