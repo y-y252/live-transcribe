@@ -266,13 +266,41 @@ function salvage(text){
 }
 
 /* ---- 音声認識（iOS Safari は無音などで勝手に止まるため自動再開） ---- */
+/* v6: Chrome のセッション寿命(約60秒)対策のウォッチドッグ。
+   セッションは50秒前後で処理を止めるのに onend が来るまで30秒ほど沈黙するため、
+   イベント待ちをやめて能動的に作り直す。 */
+var sessionStartedAt=0, lastResultAt=0, tick=null;
+function forceRestart(){
+  clearTimeout(restartTimer);
+  var old=rec;
+  if(old){ try{old.onend=null;old.onresult=null;old.onerror=null;old.abort();}catch(e){} }
+  if(interim){ salvage(interim); interim=''; render(); }
+  doneLen=0;
+  try{ startSession(); }catch(e){}
+}
+function startWatchdog(){
+  stopWatchdog();
+  tick=setInterval(function(){
+    if(!running)return;
+    var now=Date.now();
+    var idle=now-lastResultAt;
+    var age=now-sessionStartedAt;
+    var quiet=(!interim && idle>1500);
+    if(idle>12000 || (age>42000 && quiet) || age>55000){
+      forceRestart();   // 死んだ/寿命間近のセッションを待たずに作り直す
+    }
+  },2000);
+}
+function stopWatchdog(){ if(tick){clearInterval(tick);tick=null;} }
 function startSession(){
   rec=new SR();
+  sessionStartedAt=Date.now(); lastResultAt=Date.now();
   rec.lang = (lang==='ja') ? 'ja-JP' : 'en-US';
   rec.continuous=true;
   rec.interimResults=true;
   doneLen=0; lastGhost='';
   rec.onresult=function(e){
+    lastResultAt=Date.now();
     var f='',it='';
     for(var i=0;i<e.results.length;i++){
       var r=e.results[i];
@@ -322,7 +350,9 @@ function startSession(){
     }
     render();
   };
-  try{rec.start();}catch(e){}
+  try{rec.start();}catch(e){
+    if(running){restartTimer=setTimeout(function(){try{startSession();}catch(e2){}},500);} // 起動失敗を握り潰さず再試行
+  }
 }
 
 /* ---- 録音（書き出し用。失敗しても文字起こしは継続） ---- */
@@ -450,6 +480,7 @@ mainBtn.addEventListener('click',function(){
     copyNow();                      // 停止タップと同時に全文をコピー
     running=false;
     clearTimeout(restartTimer);
+    stopWatchdog();
     try{rec&&rec.stop();}catch(e){}
     stopRecording();
     prevDur=elapsedSec(); takeStart=0;
@@ -462,6 +493,8 @@ mainBtn.addEventListener('click',function(){
     setStatus('聞き取り中…');
     keepAwake(true);
     refreshUI();
+    sessionStartedAt=Date.now(); lastResultAt=Date.now();
+    startWatchdog();
     if(recTgl.checked){
       startRecording();             // 注意: 再開すると録音音声は新しいテイクに置き換わる
       setTimeout(startSession,300); // 録音と認識の同時起動の相性対策で認識をわずかに遅らせる
