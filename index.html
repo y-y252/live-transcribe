@@ -197,7 +197,11 @@ function scheduleInterimTranslation(){
   },500);
 }
 
-/* 認識器が前の文を破棄して新しい文を始めたか（言い直し修正とは区別する） */
+/* 認識器が前の文を破棄して新しい文を始めたか（言い直し修正とは区別する）
+   第1判定は「時間」: 破棄は発話の区切り（ポーズ）の後に起きるため、
+   600ms以上安定していた暫定文が前方一致しない別文に置き換わったら破棄と断定する。
+   文字指標（単語の重なり・bigram重なり）は発話中の置き換わりを拾う補助判定。 */
+var interimChangedAt=0, lastInterimVal='';   // 暫定文が最後に変化した時刻とその値
 function bigrams(s){var m={},i;for(i=0;i<s.length-1;i++){var b=s.substr(i,2);m[b]=(m[b]||0)+1;}return m;}
 function dice(a,b){
   var A=bigrams(a),B=bigrams(b),inter=0,ta=0,tb=0,k;
@@ -207,15 +211,31 @@ function dice(a,b){
   if(!ta||!tb)return 0;
   return 2*inter/(ta+tb);
 }
-function isReset(prev,next){
+function wordJacc(a,b){
+  var A=a.split(/\s+/).filter(Boolean), B=b.split(/\s+/).filter(Boolean);
+  if(!A.length||!B.length)return 0;
+  var S={},T={},k,i,inter=0,uni=0;
+  for(i=0;i<A.length;i++)S[A[i]]=1;
+  for(i=0;i<B.length;i++)T[B[i]]=1;
+  for(k in S){uni++;if(T[k])inter++;}
+  for(k in T){if(!S[k])uni++;}
+  return inter/uni;
+}
+function shouldSalvage(prev,next,stableMs){
   var x=norm(prev), y=norm(next);
   if(!x||!y)return false;
   if(x.indexOf(y)===0||y.indexOf(x)===0)return false;   // 前方一致 → 伸長・縮退であり破棄ではない
-  if(x.length<6)return false;                            // 短い文の揺れは修正扱い
-  if(y.length >= x.length*0.55)return false;             // 長さが近い → 言い直し・かな漢字変換の揺れ
-  if(/^[぀-ヿー、。\s]+$/.test(x) && /[一-鿿]/.test(y) && y.length>=x.length*0.35)
-    return false;                                        // 仮名の文が漢字混じりへ大きく縮んだ → かな漢字変換
-  return dice(x,y) < 0.5;                                // 文字の重なりが少ない → 別の文が始まった＝破棄
+  if(x.length<6)return false;                            // ごく短い揺れは修正扱い
+  if(/^[぀-ヿー、。\s]+$/.test(x) && /[一-鿿]/.test(y) && y.length>=x.length*0.3)
+    return false;                                        // 仮名の文→漢字混じり ＝ かな漢字変換
+  if(stableMs>=600)return true;                          // ポーズ後の置き換わり ＝ 区切り済みの文の破棄
+  if(lang==='en'){
+    if(x.length<12)return false;
+    if(dice(x,y)>=0.55)return false;                     // 文字の重なりが濃い → 全文言い直し
+    return wordJacc(x,y)<0.35;                           // 単語がほぼ共通しない → 別の文＝破棄
+  }
+  if(y.length>=x.length*0.55)return false;               // 日本語: 長さが近い揺れは変換・言い直し
+  return dice(x,y)<0.5;
 }
 /* 破棄されかけた文を確定へ格上げ（エンジンが実際に出力した文字だけ。推測補完はしない） */
 function salvage(text){
@@ -249,13 +269,17 @@ function startSession(){
     }else{
       if(it==='' && interim){
         /* 確定なしで暫定だけ消えた → まだ捨てない（次の確定か onend まで保持） */
-      }else if(interim && it && isReset(interim,it)){
-        salvage(interim);                        // 破棄検知 → 温存してから新しい文へ
+      }else if(interim && it && interim!==it){
+        var stableMs=interimChangedAt? (Date.now()-interimChangedAt) : 999999;
+        if(shouldSalvage(interim,it,stableMs)){
+          salvage(interim);                      // 破棄検知 → 温存してから新しい文へ
+        }
         interim=it;
       }else{
         interim=it;                              // 通常の伸長・言い直し修正
       }
     }
+    if(interim!==lastInterimVal){ lastInterimVal=interim; interimChangedAt=Date.now(); }
     render();
     scheduleInterimTranslation();
   };
