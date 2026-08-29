@@ -52,6 +52,7 @@ body.rec .dot{visibility:visible}
     <button id="langEn" type="button">English</button>
   </div>
   <label class="tgl"><input type="checkbox" id="transTgl" checked>翻訳</label>
+  <label class="tgl"><input type="checkbox" id="recTgl" checked>録音</label>
 </header>
 <main>
   <div class="pane" id="srcPane">
@@ -81,17 +82,22 @@ body.rec .dot{visibility:visible}
 <script>
 (function(){
 'use strict';
+/* v3: 認識エンジンが未確定文を破棄して次の文へ移る挙動（英語で顕著）を検知し、
+   破棄される直前のテキストを確定へ格上げして温存する。推測による穴埋めは一切しない。 */
 var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 var srcTxt=document.getElementById('srcTxt'), transTxt=document.getElementById('transTxt'),
     mainBtn=document.getElementById('mainBtn'), statusEl=document.getElementById('status'),
     jaBtn=document.getElementById('langJa'), enBtn=document.getElementById('langEn'),
     transTgl=document.getElementById('transTgl'), transPane=document.getElementById('transPane'),
+    recTgl=document.getElementById('recTgl'),
     srcPane=document.getElementById('srcPane'), exportBar=document.getElementById('exportBar');
 
 var lang='ja';                 // 'ja' | 'en'（入力言語）
 var running=false, rec=null, restartTimer=null;
-var committed='', sessionFinal='', interim='';
-var doneLen=0;                 // sessionFinal のうち確定チャンク化済みの長さ
+var committed='';              // 受理済みの確定テキスト（表示・コピーの本体）
+var interim='';                // 表示中の暫定テキスト
+var doneLen=0;                 // 現セッションの finals のうちチャンク化済みの長さ
+var lastGhost='';              // 直前に救済した文（正規化済み・二重取り込み防止用）
 var transDone='', transInterim='';
 var tChain=Promise.resolve();  // 翻訳の順序保証キュー
 var interimTimer=null, transErrShown=false;
@@ -99,7 +105,7 @@ var wl=null;
 
 /* 確定セグメント（タイムスタンプ付き・VTT用） */
 var segs=[];                   // {t0,t1,src,tr}
-var takeStart=0, prevDur=0;    // 累積経過秒の管理
+var takeStart=0, prevDur=0;
 
 /* 録音 */
 var mediaStream=null, recorder=null, audioChunks=[], audioMime='audio/mp4';
@@ -107,12 +113,13 @@ var mediaStream=null, recorder=null, audioChunks=[], audioMime='audio/mp4';
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function joiner(){return lang==='en' ? ' ' : '';}
 function fullText(){
-  var t=committed+sessionFinal;
+  var t=committed;
   if(interim) t+=joiner()+interim;
   return t.trim();
 }
 function setStatus(t){statusEl.textContent=t;}
 function elapsedSec(){return prevDur + (takeStart? (Date.now()-takeStart)/1000 : 0);}
+function norm(s){return s.trim().toLowerCase().replace(/\s+/g,' ');}
 
 /* ---- スクロール追従（遡り中は固定・「最新へ」で復帰） ---- */
 function makeFollow(el,btn){
@@ -131,7 +138,7 @@ var fSrc=makeFollow(srcTxt,document.getElementById('srcJump'));
 var fTr =makeFollow(transTxt,document.getElementById('trJump'));
 
 function render(){
-  srcTxt.innerHTML = esc(committed+sessionFinal) +
+  srcTxt.innerHTML = esc(committed) +
     (interim ? '<span class="interim">'+esc(joiner()+interim)+'</span>' : '');
   if(fSrc.on) srcTxt.scrollTop = srcTxt.scrollHeight;
   transTxt.innerHTML = esc(transDone) +
@@ -142,6 +149,7 @@ function refreshUI(){
   document.body.classList.toggle('rec',running);
   mainBtn.textContent = running ? '停止' : '開始';
   exportBar.hidden = running || (segs.length===0 && audioChunks.length===0);
+  recTgl.disabled = running;   // 録音のON/OFFは開始前に切り替える
 }
 
 /* ---- 翻訳（Google 翻訳の非公式エンドポイント・キー不要） ---- */
@@ -153,10 +161,11 @@ function translateReq(text,sl){
     .then(function(j){return (j[0]||[]).map(function(x){return (x&&x[0])||'';}).join('');});
 }
 
-/* 確定テキストを1チャンク登録（VTTセグメント化＋翻訳キュー投入） */
-function addFinalChunk(text){
+/* 確定テキストを1チャンク受理: 表示へ反映＋VTTセグメント化＋翻訳キュー投入 */
+function commitChunk(text){
   var trimmed=text.trim();
   if(!trimmed)return;
+  committed += trimmed + (lang==='en'?' ':'');
   var now=elapsedSec();
   var seg={t0:(segs.length?segs[segs.length-1].t1:0), t1:now, src:trimmed, tr:''};
   segs.push(seg);
@@ -188,23 +197,62 @@ function scheduleInterimTranslation(){
   },500);
 }
 
+/* 認識器が前の文を破棄して新しい文を始めたか（言い直し修正とは区別する） */
+function bigrams(s){var m={},i;for(i=0;i<s.length-1;i++){var b=s.substr(i,2);m[b]=(m[b]||0)+1;}return m;}
+function dice(a,b){
+  var A=bigrams(a),B=bigrams(b),inter=0,ta=0,tb=0,k;
+  for(k in A)ta+=A[k];
+  for(k in B)tb+=B[k];
+  for(k in A)if(B[k])inter+=Math.min(A[k],B[k]);
+  if(!ta||!tb)return 0;
+  return 2*inter/(ta+tb);
+}
+function isReset(prev,next){
+  var x=norm(prev), y=norm(next);
+  if(!x||!y)return false;
+  if(x.indexOf(y)===0||y.indexOf(x)===0)return false;   // 前方一致 → 伸長・縮退であり破棄ではない
+  if(x.length<6)return false;                            // 短い文の揺れは修正扱い
+  if(y.length >= x.length*0.55)return false;             // 長さが近い → 言い直し・かな漢字変換の揺れ
+  return dice(x,y) < 0.5;                                // 文字の重なりが少ない → 別の文が始まった＝破棄
+}
+/* 破棄されかけた文を確定へ格上げ（エンジンが実際に出力した文字だけ。推測補完はしない） */
+function salvage(text){
+  commitChunk(text);
+  lastGhost=norm(text);
+}
+
 /* ---- 音声認識（iOS Safari は無音などで勝手に止まるため自動再開） ---- */
 function startSession(){
   rec=new SR();
   rec.lang = (lang==='ja') ? 'ja-JP' : 'en-US';
   rec.continuous=true;
   rec.interimResults=true;
+  doneLen=0; lastGhost='';
   rec.onresult=function(e){
     var f='',it='';
     for(var i=0;i<e.results.length;i++){
       var r=e.results[i];
       if(r.isFinal) f+=r[0].transcript; else it+=r[0].transcript;
     }
-    sessionFinal=f; interim=it;
-    if(sessionFinal.length>doneLen){
-      var chunk=sessionFinal.slice(doneLen);
-      doneLen=sessionFinal.length;
-      addFinalChunk(chunk);
+    if(f.length<doneLen) doneLen=0;              // 稀な finals リセットに追従
+    if(f.length>doneLen){
+      var chunk=f.slice(doneLen); doneLen=f.length;
+      var nc=norm(chunk);
+      if(lastGhost && nc && (nc===lastGhost || nc.indexOf(lastGhost)===0 || lastGhost.indexOf(nc)===0)){
+        lastGhost='';                            // 救済済みの文が後から確定した → 二重追加しない
+      }else{
+        commitChunk(chunk);
+      }
+      interim=it;
+    }else{
+      if(it==='' && interim){
+        /* 確定なしで暫定だけ消えた → まだ捨てない（次の確定か onend まで保持） */
+      }else if(interim && it && isReset(interim,it)){
+        salvage(interim);                        // 破棄検知 → 温存してから新しい文へ
+        interim=it;
+      }else{
+        interim=it;                              // 通常の伸長・言い直し修正
+      }
     }
     render();
     scheduleInterimTranslation();
@@ -216,18 +264,8 @@ function startSession(){
     }
   };
   rec.onend=function(){
-    // 確定分の残りをセグメント化
-    if(sessionFinal.length>doneLen){
-      addFinalChunk(sessionFinal.slice(doneLen));
-      doneLen=sessionFinal.length;
-    }
-    if(sessionFinal){committed+=sessionFinal+joiner();sessionFinal='';doneLen=0;}
-    // 取りこぼし防止: セッションが区切られた時点の暫定テキストは捨てずに確定へ格上げする
-    if(interim){
-      committed+=joiner()+interim;
-      addFinalChunk(interim);
-      interim='';
-    }
+    if(interim){ salvage(interim); interim=''; } // セッション終了時の暫定分も温存
+    doneLen=0;
     if(running){
       restartTimer=setTimeout(function(){try{startSession();}catch(e){}},120);
     }else{
@@ -242,7 +280,13 @@ function startSession(){
 /* ---- 録音（書き出し用。失敗しても文字起こしは継続） ---- */
 function startRecording(){
   if(!navigator.mediaDevices||!window.MediaRecorder)return;
-  navigator.mediaDevices.getUserMedia({audio:true}).then(function(s){
+  /* 無加工マイク: エコーキャンセル/ノイズ抑制/自動ゲインを切る。
+     既定の加工が入ると、スピーカー再生音やBGM混じりの声が「ノイズ・エコー」として
+     消され、認識エンジンに渡る音まで劣化する（v2で認識が悪化した主因の推定） */
+  var rawAudio={echoCancellation:false, noiseSuppression:false, autoGainControl:false};
+  navigator.mediaDevices.getUserMedia({audio:rawAudio}).catch(function(){
+    return navigator.mediaDevices.getUserMedia({audio:true});
+  }).then(function(s){
     mediaStream=s;
     var mime='';
     if(MediaRecorder.isTypeSupported){
@@ -367,17 +411,21 @@ mainBtn.addEventListener('click',function(){
     running=true;
     if(segs.length===0)prevDur=0;
     takeStart=Date.now();
-    startRecording();               // 注意: 再開すると録音音声は新しいテイクに置き換わる
     setStatus('聞き取り中…');
     keepAwake(true);
     refreshUI();
-    setTimeout(startSession,300);   // 録音と認識の同時起動の相性対策で認識をわずかに遅らせる
+    if(recTgl.checked){
+      startRecording();             // 注意: 再開すると録音音声は新しいテイクに置き換わる
+      setTimeout(startSession,300); // 録音と認識の同時起動の相性対策で認識をわずかに遅らせる
+    }else{
+      startSession();               // 録音OFF: マイクは認識エンジン専有（最も認識が安定）
+    }
   }
 });
 document.getElementById('copyBtn').addEventListener('click',copyNow);
 document.getElementById('clearBtn').addEventListener('click',function(){
-  committed=sessionFinal=interim=transDone=transInterim='';
-  doneLen=0; segs=[]; audioChunks=[]; prevDur=0; takeStart=running?Date.now():0;
+  committed=interim=transDone=transInterim='';
+  doneLen=0; lastGhost=''; segs=[]; audioChunks=[]; prevDur=0; takeStart=running?Date.now():0;
   render(); refreshUI();
   setStatus('消去しました');
 });
