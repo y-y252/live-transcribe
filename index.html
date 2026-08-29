@@ -93,7 +93,7 @@ var srcTxt=document.getElementById('srcTxt'), transTxt=document.getElementById('
     recTgl=document.getElementById('recTgl'),
     srcPane=document.getElementById('srcPane'), exportBar=document.getElementById('exportBar');
 
-var V='v9';                    // 画面表示用バージョン（キャッシュ確認用）
+var V='v10';                   // 画面表示用バージョン（キャッシュ確認用）
 var everStarted=false;         // 一度でも開始したか（ログボタン表示用）
 var diagBuf=[];                // 診断ログ（セッション・エラー・再起動の時系列）
 function diag(m){
@@ -303,7 +303,7 @@ function startWatchdog(){
   },2000);
 }
 function stopWatchdog(){ if(tick){clearInterval(tick);tick=null;} }
-var sessionHadResult=false, consecFail=0;
+var sessionHadResult=false, consecFail=0, abortStreak=0;
 function startSession(){
   rec=new SR();
   sessionStartedAt=Date.now(); lastResultAt=Date.now(); sessionHadResult=false;
@@ -316,7 +316,7 @@ function startSession(){
   rec.onresult=function(e){
     lastResultAt=Date.now();
     if(!sessionHadResult){
-      sessionHadResult=true; consecFail=0;
+      sessionHadResult=true; consecFail=0; abortStreak=0;
       diag('first result +'+(Date.now()-sessionStartedAt)+'ms');
     }
     var f='',it='';
@@ -353,6 +353,7 @@ function startSession(){
   };
   rec.onerror=function(e){
     diag('error '+e.error);
+    if(e.error==='aborted' && !sessionHadResult)abortStreak++;
     if(e.error==='not-allowed'||e.error==='service-not-allowed'){
       running=false; refreshUI(); keepAwake(false); stopRecording();
       setStatus('マイク/音声認識が許可されていません。設定 > Safari > マイク を確認してください');
@@ -362,6 +363,16 @@ function startSession(){
     diag('end age='+((Date.now()-sessionStartedAt)/1000).toFixed(1)+'s'+(sessionHadResult?'':' (no result)'));
     if(interim){ salvage(interim); interim=''; } // セッション終了時の暫定分も温存
     doneLen=0;
+    if(running && abortStreak>=3){
+      /* 音が届いているのに認識サービスが結果を返さず abort が続く
+         ＝ Chrome 内部の音声認識サービスが固まっている（再起動でしか直らない）。
+         無限に再試行せず、原因と対処を画面に出して止まる */
+      running=false; stopWatchdog(); stopRecording(); keepAwake(false); refreshUI();
+      diag('abort-storm stop');
+      setStatus('ブラウザの音声認識が応答しません。Chrome を完全終了（Mac は Cmd+Q）→再起動してから、もう一度お試しください');
+      transInterim=''; render();
+      return;
+    }
     if(running){
       var delay=120;
       if(!sessionHadResult){                     // 結果ゼロで即死 → サービス拒否の可能性。間隔を空けて再試行
@@ -516,6 +527,7 @@ mainBtn.addEventListener('click',function(){
   }else{
     running=true;
     everStarted=true;
+    abortStreak=0; consecFail=0;
     if(segs.length===0)prevDur=0;
     takeStart=Date.now();
     setStatus('聞き取り中…');
