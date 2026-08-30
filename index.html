@@ -724,8 +724,9 @@ function whPump(){
     .catch(function(e){ whDiag('infer error '+String(e&&e.message||e).slice(0,80)); })
     .then(function(){
       wh.busy=false;
-      if(wh.queue.length) whPump();
-      else if(wh.running) setStatus('聞き取り中…（ローカルAI・'+wh.dev+(wh.srcKind==='tab'?'・タブ音声':'・マイク')+'）');
+      if(wh.queue.length){ whPump(); return; }
+      if(wh.running){ setStatus('聞き取り中…（ローカルAI・'+wh.dev+(wh.srcKind==='tab'?'・タブ音声':'・マイク')+'）'); }
+      else if(wh.copyPending){ wh.copyPending=false; copyNow(); }   // 停止後: 最後のセグメントまで載せてからコピー
     });
 }
 function whStart(){
@@ -802,11 +803,14 @@ function whStop(){
 mainBtn.addEventListener('click',function(){
   if(engine==='sr' && !SR){setStatus('このブラウザは音声認識に未対応です。「ローカルAI」エンジンをお試しください');return;}
   if(running){
-    copyNow();                      // 停止タップと同時に全文をコピー
     running=false;
     if(engine==='wh'){
       whStop();
+      /* 認識待ちが残っていれば、最後のセグメントが載ってからコピーする */
+      if(wh.busy || wh.queue.length){ wh.copyPending=true; setStatus('最後の認識を仕上げています…'); }
+      else copyNow();
     }else{
+      copyNow();                    // 停止タップと同時に全文をコピー
       clearTimeout(restartTimer);
       stopWatchdog();
       stopMonitor();
