@@ -93,7 +93,7 @@ var srcTxt=document.getElementById('srcTxt'), transTxt=document.getElementById('
     recTgl=document.getElementById('recTgl'),
     srcPane=document.getElementById('srcPane'), exportBar=document.getElementById('exportBar');
 
-var V='v11';                   // 画面表示用バージョン（キャッシュ確認用）
+var V='v12';                   // 画面表示用バージョン（キャッシュ確認用）
 var everStarted=false;         // 一度でも開始したか（ログボタン表示用）
 var diagBuf=[];                // 診断ログ（セッション・エラー・再起動の時系列）
 function diag(m){
@@ -304,7 +304,7 @@ function startWatchdog(){
   },2000);
 }
 function stopWatchdog(){ if(tick){clearInterval(tick);tick=null;} }
-var sessionHadResult=false, consecFail=0, abortStreak=0;
+var sessionHadResult=false, sessionHadSpeech=false, consecFail=0, abortStreak=0;
 /* v11: 英語認識の自動フォールバック。
    一部の Chrome で en-US だけが結果ゼロのまま沈黙する事象が実測されたため
    （同じマイク・同じ瞬間に en-GB / en-AU は正常）、結果ゼロのセッションが続いたら
@@ -323,7 +323,9 @@ function rotateEnVariant(reason){
    英語なら未試行のバリアントへ回す。回したら true。 */
 function noteSessionOutcome(){
   if(!running) return false;
-  if(!sessionHadResult && (Date.now()-sessionStartedAt)>5000) zeroSessions++;
+  /* v12: 無音セッションは故障に数えない。音声検知(speechstart)があったのに
+     結果ゼロで死んだセッションだけを「ゾンビ」として数える */
+  if(!sessionHadResult && sessionHadSpeech && (Date.now()-sessionStartedAt)>4000) zeroSessions++;
   if(lang==='en' && rotationsThisRun<EN_VARIANTS.length-1 && (abortStreak>=3 || zeroSessions>=2)){
     rotateEnVariant(abortStreak>=3?'abort-storm':'zero-results');
     return true;
@@ -332,13 +334,14 @@ function noteSessionOutcome(){
 }
 function startSession(){
   rec=new SR();
-  sessionStartedAt=Date.now(); lastResultAt=Date.now(); sessionHadResult=false;
+  sessionStartedAt=Date.now(); lastResultAt=Date.now(); sessionHadResult=false; sessionHadSpeech=false;
   rec.lang = (lang==='ja') ? 'ja-JP' : EN_VARIANTS[enIdx];
   rec.continuous=true;
   rec.interimResults=true;
   if(localASR[rec.lang]){try{rec.processLocally=true;}catch(e){}}
   diag('start '+rec.lang+(localASR[rec.lang]?' [local]':' [network]'));
   doneLen=0; lastGhost='';
+  rec.onspeechstart=function(){ sessionHadSpeech=true; };
   rec.onresult=function(e){
     lastResultAt=Date.now();
     if(!sessionHadResult){
