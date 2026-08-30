@@ -93,7 +93,7 @@ var srcTxt=document.getElementById('srcTxt'), transTxt=document.getElementById('
     recTgl=document.getElementById('recTgl'),
     srcPane=document.getElementById('srcPane'), exportBar=document.getElementById('exportBar');
 
-var V='v12';                   // 画面表示用バージョン（キャッシュ確認用）
+var V='v13';                   // 画面表示用バージョン（キャッシュ確認用）
 var everStarted=false;         // 一度でも開始したか（ログボタン表示用）
 var diagBuf=[];                // 診断ログ（セッション・エラー・再起動の時系列）
 function diag(m){
@@ -278,8 +278,45 @@ function salvage(text){
 /* ---- 音声認識（iOS Safari は無音などで勝手に止まるため自動再開） ---- */
 /* v6: Chrome のセッション寿命(約60秒)対策のウォッチドッグ。
    セッションは50秒前後で処理を止めるのに onend が来るまで30秒ほど沈黙するため、
-   イベント待ちをやめて能動的に作り直す。 */
+   イベント待ちをやめて能動的に作り直す。
+   v13: マイク音量の常時監視を追加（実測: 30〜44秒でセッションが無言死→12秒検知＋数秒の
+   再開遅延＝約20秒のフリーズが出ていた）。
+   - 音が来ているのに結果が止まった → 4.5秒で死亡判定して即作り直し（従来12秒）
+   - セッションが死にやすい28秒以降は、会話の切れ目（無音）を狙って先回りで作り直す
+     （再開直後の応答遅延が無音時間に吸収され、発話中の取りこぼしが減る） */
 var sessionStartedAt=0, lastResultAt=0, tick=null;
+var monStream=null, monCtx=null, monAnalyser=null, monData=null, lastVoiceAt=0, noiseFloor=0.006;
+function startMonitor(){
+  if(monStream) return;
+  try{
+    navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}}).then(function(st){
+      monStream=st;
+      var AC=window.AudioContext||window.webkitAudioContext;
+      monCtx=new AC();
+      if(monCtx.state==='suspended'){ try{monCtx.resume();}catch(e){} }
+      var srcN=monCtx.createMediaStreamSource(st);
+      monAnalyser=monCtx.createAnalyser(); monAnalyser.fftSize=512;
+      srcN.connect(monAnalyser);
+      monData=new Uint8Array(monAnalyser.fftSize);
+      diag('audio monitor on');
+    }).catch(function(e){ diag('audio monitor unavailable: '+e.name); });
+  }catch(e){ diag('audio monitor error'); }
+}
+function stopMonitor(){
+  try{ if(monStream)monStream.getTracks().forEach(function(t){t.stop();}); }catch(e){}
+  monStream=null;
+  try{ if(monCtx)monCtx.close(); }catch(e){}
+  monCtx=null; monAnalyser=null; monData=null;
+}
+function voiceLevel(){
+  if(!monAnalyser||!monData) return -1;
+  try{
+    monAnalyser.getByteTimeDomainData(monData);
+    var s=0;
+    for(var i=0;i<monData.length;i++){ var v=(monData[i]-128)/128; s+=v*v; }
+    return Math.sqrt(s/monData.length);
+  }catch(e){ return -1; }
+}
 function forceRestart(){
   clearTimeout(restartTimer);
   var old=rec;
@@ -291,17 +328,36 @@ function forceRestart(){
 }
 function startWatchdog(){
   stopWatchdog();
+  lastVoiceAt=0;
   tick=setInterval(function(){
     if(!running)return;
     var now=Date.now();
     var idle=now-lastResultAt;
     var age=now-sessionStartedAt;
     var quiet=(!interim && idle>1500);
+    var lvl=voiceLevel();
+    if(lvl>=0){
+      if(lvl<noiseFloor) noiseFloor=noiseFloor*0.8+lvl*0.2;          // 静かな瞬間に床を追従
+      else noiseFloor=Math.min(0.02, noiseFloor*1.002);
+      if(lvl>Math.max(0.012, noiseFloor*3)) lastVoiceAt=now;
+    }
+    var voiceRecent = lastVoiceAt>0 && (now-lastVoiceAt)<2500;
+    /* 音が来ているのに結果が止まった＝セッション無言死。ただし開始直後の
+       初回応答遅延（実測2〜7秒）を誤検知しないよう、未応答セッションは9秒まで待つ */
+    if(voiceRecent && idle>4500 && (sessionHadResult || age>9000)){
+      diag('watchdog dead-session (audio active) idle='+(idle/1000).toFixed(1)+'s age='+(age/1000).toFixed(1)+'s');
+      forceRestart(); return;
+    }
+    /* 会話の切れ目での先回りローテーション（死にやすい帯に入る前に作り直す） */
+    if(lvl>=0 && age>28000 && !voiceRecent && quiet){
+      diag('watchdog proactive-rotate at pause age='+(age/1000).toFixed(1)+'s');
+      forceRestart(); return;
+    }
     if(idle>12000 || (age>42000 && quiet) || age>55000){
       diag('watchdog idle='+(idle/1000).toFixed(1)+'s age='+(age/1000).toFixed(1)+'s');
       forceRestart();   // 死んだ/寿命間近のセッションを待たずに作り直す
     }
-  },2000);
+  },1000);
 }
 function stopWatchdog(){ if(tick){clearInterval(tick);tick=null;} }
 var sessionHadResult=false, sessionHadSpeech=false, consecFail=0, abortStreak=0;
@@ -385,7 +441,7 @@ function startSession(){
     diag('error '+e.error);
     if(e.error==='aborted' && !sessionHadResult)abortStreak++;
     if(e.error==='not-allowed'||e.error==='service-not-allowed'){
-      running=false; refreshUI(); keepAwake(false); stopRecording();
+      running=false; refreshUI(); keepAwake(false); stopRecording(); stopMonitor();
       setStatus('マイク/音声認識が許可されていません。設定 > Safari > マイク を確認してください');
     }
   };
@@ -401,7 +457,7 @@ function startSession(){
       /* 音が届いているのに認識サービスが結果を返さず abort が続く
          ＝ Chrome 内部の音声認識サービスが固まっている（再起動でしか直らない）。
          無限に再試行せず、原因と対処を画面に出して止まる */
-      running=false; stopWatchdog(); stopRecording(); keepAwake(false); refreshUI();
+      running=false; stopWatchdog(); stopMonitor(); stopRecording(); keepAwake(false); refreshUI();
       diag('abort-storm stop');
       setStatus('ブラウザの音声認識が応答しません。Chrome を完全終了（Mac は Cmd+Q）→再起動してから、もう一度お試しください');
       transInterim=''; render();
@@ -553,6 +609,7 @@ mainBtn.addEventListener('click',function(){
     running=false;
     clearTimeout(restartTimer);
     stopWatchdog();
+    stopMonitor();
     try{rec&&rec.stop();}catch(e){}
     stopRecording();
     prevDur=elapsedSec(); takeStart=0;
@@ -569,6 +626,7 @@ mainBtn.addEventListener('click',function(){
     refreshUI();
     sessionStartedAt=Date.now(); lastResultAt=Date.now();
     startWatchdog();
+    startMonitor();                 // v13: 音量監視（死んだセッションの即検知・切れ目ローテ用）
     if(recTgl.checked){
       startRecording();             // 注意: 再開すると録音音声は新しいテイクに置き換わる
       setTimeout(startSession,300); // 録音と認識の同時起動の相性対策で認識をわずかに遅らせる
