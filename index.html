@@ -93,7 +93,7 @@ var srcTxt=document.getElementById('srcTxt'), transTxt=document.getElementById('
     recTgl=document.getElementById('recTgl'),
     srcPane=document.getElementById('srcPane'), exportBar=document.getElementById('exportBar');
 
-var V='v10';                   // 画面表示用バージョン（キャッシュ確認用）
+var V='v11';                   // 画面表示用バージョン（キャッシュ確認用）
 var everStarted=false;         // 一度でも開始したか（ログボタン表示用）
 var diagBuf=[];                // 診断ログ（セッション・エラー・再起動の時系列）
 function diag(m){
@@ -286,6 +286,7 @@ function forceRestart(){
   if(old){ try{old.onend=null;old.onresult=null;old.onerror=null;old.abort();}catch(e){} }
   if(interim){ salvage(interim); interim=''; render(); }
   doneLen=0;
+  noteSessionOutcome();                          // 結果ゼロのゾンビ死もカウント（英語なら経路を回す）
   try{ startSession(); }catch(e){}
 }
 function startWatchdog(){
@@ -304,10 +305,35 @@ function startWatchdog(){
 }
 function stopWatchdog(){ if(tick){clearInterval(tick);tick=null;} }
 var sessionHadResult=false, consecFail=0, abortStreak=0;
+/* v11: 英語認識の自動フォールバック。
+   一部の Chrome で en-US だけが結果ゼロのまま沈黙する事象が実測されたため
+   （同じマイク・同じ瞬間に en-GB / en-AU は正常）、結果ゼロのセッションが続いたら
+   地域バリアントを自動で切り替える。成功した経路は localStorage に記憶する。 */
+var EN_VARIANTS=['en-US','en-GB','en-AU'];
+var enIdx=0; try{ var _s=localStorage.getItem('lt_envar'); var _i=EN_VARIANTS.indexOf(_s); if(_i>=0)enIdx=_i; }catch(e){}
+var zeroSessions=0, rotationsThisRun=0;
+function rotateEnVariant(reason){
+  enIdx=(enIdx+1)%EN_VARIANTS.length; rotationsThisRun++;
+  try{ localStorage.setItem('lt_envar', EN_VARIANTS[enIdx]); }catch(e){}
+  diag('rotate en -> '+EN_VARIANTS[enIdx]+' ('+reason+')');
+  setStatus('英語認識エンジンを '+EN_VARIANTS[enIdx]+' に切替えました');
+  consecFail=0; abortStreak=0; zeroSessions=0;
+}
+/* セッションが「音は流れているのに結果ゼロ」で死んだかを記録し、
+   英語なら未試行のバリアントへ回す。回したら true。 */
+function noteSessionOutcome(){
+  if(!running) return false;
+  if(!sessionHadResult && (Date.now()-sessionStartedAt)>5000) zeroSessions++;
+  if(lang==='en' && rotationsThisRun<EN_VARIANTS.length-1 && (abortStreak>=3 || zeroSessions>=2)){
+    rotateEnVariant(abortStreak>=3?'abort-storm':'zero-results');
+    return true;
+  }
+  return false;
+}
 function startSession(){
   rec=new SR();
   sessionStartedAt=Date.now(); lastResultAt=Date.now(); sessionHadResult=false;
-  rec.lang = (lang==='ja') ? 'ja-JP' : 'en-US';
+  rec.lang = (lang==='ja') ? 'ja-JP' : EN_VARIANTS[enIdx];
   rec.continuous=true;
   rec.interimResults=true;
   if(localASR[rec.lang]){try{rec.processLocally=true;}catch(e){}}
@@ -316,8 +342,9 @@ function startSession(){
   rec.onresult=function(e){
     lastResultAt=Date.now();
     if(!sessionHadResult){
-      sessionHadResult=true; consecFail=0; abortStreak=0;
+      sessionHadResult=true; consecFail=0; abortStreak=0; zeroSessions=0;
       diag('first result +'+(Date.now()-sessionStartedAt)+'ms');
+      if(lang==='en'){ try{ localStorage.setItem('lt_envar', EN_VARIANTS[enIdx]); }catch(e){} }
     }
     var f='',it='';
     for(var i=0;i<e.results.length;i++){
@@ -363,7 +390,11 @@ function startSession(){
     diag('end age='+((Date.now()-sessionStartedAt)/1000).toFixed(1)+'s'+(sessionHadResult?'':' (no result)'));
     if(interim){ salvage(interim); interim=''; } // セッション終了時の暫定分も温存
     doneLen=0;
-    if(running && abortStreak>=3){
+    if(noteSessionOutcome()){                    // 英語バリアントを回した → 新しい経路で即再開
+      restartTimer=setTimeout(function(){try{startSession();}catch(e){}},250);
+      render(); return;
+    }
+    if(running && (abortStreak>=3 || zeroSessions>=4)){
       /* 音が届いているのに認識サービスが結果を返さず abort が続く
          ＝ Chrome 内部の音声認識サービスが固まっている（再起動でしか直らない）。
          無限に再試行せず、原因と対処を画面に出して止まる */
@@ -527,7 +558,7 @@ mainBtn.addEventListener('click',function(){
   }else{
     running=true;
     everStarted=true;
-    abortStreak=0; consecFail=0;
+    abortStreak=0; consecFail=0; zeroSessions=0; rotationsThisRun=0;
     if(segs.length===0)prevDur=0;
     takeStart=Date.now();
     setStatus('聞き取り中…');
