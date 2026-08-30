@@ -93,7 +93,7 @@ var srcTxt=document.getElementById('srcTxt'), transTxt=document.getElementById('
     recTgl=document.getElementById('recTgl'),
     srcPane=document.getElementById('srcPane'), exportBar=document.getElementById('exportBar');
 
-var V='v13';                   // 画面表示用バージョン（キャッシュ確認用）
+var V='v14';                   // 画面表示用バージョン（キャッシュ確認用）
 var everStarted=false;         // 一度でも開始したか（ログボタン表示用）
 var diagBuf=[];                // 診断ログ（セッション・エラー・再起動の時系列）
 function diag(m){
@@ -414,6 +414,16 @@ function startSession(){
     if(f.length>doneLen){
       var chunk=f.slice(doneLen); doneLen=f.length;
       var nc=norm(chunk);
+      /* v14: 確定チャンクにも新しい暫定にも引き継がれない旧暫定を、上書き前に温存する。
+         一度画面に表示された文が、次の文の確定と同時に黙って消える穴（実測: エンジンが
+         結果配列を内部リセットした際、未確定のまま消えた文が確定経路では救済されなかった） */
+      if(interim){
+        var oi=norm(interim), nit=norm(it||'');
+        var carried =
+          (nc && (nc.indexOf(oi)>=0 || oi.indexOf(nc)===0 || contained(oi,nc)>=0.6)) ||
+          (nit && (nit.indexOf(oi)>=0 || oi.indexOf(nit)===0 || contained(oi,nit)>=0.6));
+        if(!carried && oi.length>=6){ salvage(interim); }
+      }
       if(lastGhost && nc && (nc===lastGhost || nc.indexOf(lastGhost)===0 || lastGhost.indexOf(nc)===0)){
         lastGhost='';                            // 救済済みの文が後から確定した → 二重追加しない
       }else{
