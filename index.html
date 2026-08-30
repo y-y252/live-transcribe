@@ -10,7 +10,7 @@
 html,body{height:100%}
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Helvetica Neue",sans-serif;
   background:#f2f2f7;color:#1c1c1e;display:flex;flex-direction:column;height:100dvh;overflow:hidden}
-header{flex:none;display:flex;align-items:center;gap:8px;padding:10px 12px;background:#fff;border-bottom:1px solid #e3e3e8}
+header{flex:none;display:flex;align-items:center;gap:8px;padding:10px 12px;background:#fff;border-bottom:1px solid #e3e3e8;flex-wrap:wrap}
 h1{font-size:15px;margin:0;flex:1;font-weight:700;white-space:nowrap}
 .seg{display:flex;border:1px solid #0a84ff;border-radius:8px;overflow:hidden;flex:none}
 .seg button{border:0;background:#fff;color:#0a84ff;font-size:13px;padding:6px 10px;font-weight:600}
@@ -53,6 +53,14 @@ body.rec .dot{visibility:visible}
   </div>
   <label class="tgl"><input type="checkbox" id="transTgl" checked>翻訳</label>
   <label class="tgl"><input type="checkbox" id="recTgl" checked>録音</label>
+  <div class="seg" id="engSeg">
+    <button id="engSR" class="on" type="button">標準</button>
+    <button id="engWH" type="button">ローカルAI</button>
+  </div>
+  <div class="seg" id="srcSeg" style="display:none">
+    <button id="srcMic" class="on" type="button">マイク</button>
+    <button id="srcTab" type="button">タブ音声</button>
+  </div>
 </header>
 <main>
   <div class="pane" id="srcPane">
@@ -93,7 +101,7 @@ var srcTxt=document.getElementById('srcTxt'), transTxt=document.getElementById('
     recTgl=document.getElementById('recTgl'),
     srcPane=document.getElementById('srcPane'), exportBar=document.getElementById('exportBar');
 
-var V='v14';                   // 画面表示用バージョン（キャッシュ確認用）
+var V='v15';                   // 画面表示用バージョン（キャッシュ確認用）
 var everStarted=false;         // 一度でも開始したか（ログボタン表示用）
 var diagBuf=[];                // 診断ログ（セッション・エラー・再起動の時系列）
 function diag(m){
@@ -493,15 +501,17 @@ function startSession(){
 }
 
 /* ---- 録音（書き出し用。失敗しても文字起こしは継続） ---- */
-function startRecording(){
+function startRecording(streamOverride){
   if(!navigator.mediaDevices||!window.MediaRecorder)return;
   /* 無加工マイク: エコーキャンセル/ノイズ抑制/自動ゲインを切る。
      既定の加工が入ると、スピーカー再生音やBGM混じりの声が「ノイズ・エコー」として
      消され、認識エンジンに渡る音まで劣化する（v2で認識が悪化した主因の推定） */
   var rawAudio={echoCancellation:false, noiseSuppression:false, autoGainControl:false};
-  navigator.mediaDevices.getUserMedia({audio:rawAudio}).catch(function(){
-    return navigator.mediaDevices.getUserMedia({audio:true});
-  }).then(function(s){
+  (streamOverride ? Promise.resolve(streamOverride)
+   : navigator.mediaDevices.getUserMedia({audio:rawAudio}).catch(function(){
+       return navigator.mediaDevices.getUserMedia({audio:true});
+     })
+  ).then(function(s){
     mediaStream=s;
     var mime='';
     if(MediaRecorder.isTypeSupported){
@@ -611,16 +621,197 @@ document.addEventListener('visibilitychange',function(){
   if(document.visibilityState==='visible'&&running)keepAwake(true);
 });
 
+/* ==== v15: ローカルAI認識（Whisper・ブラウザ内推論・API利用料ゼロ） ====
+   目的: スピーカー越しのテレカン音声の確実な捕捉。
+   - Web Speech と違い、認識に使う音声ストリームをこちらで選べる:
+     マイク（AECオフ＝スピーカー再生音が打ち消されない）／タブ・画面共有の音声（デジタル直取り）
+   - 連続バッファ＋無音区切りの逐次推論なので、セッション死・再作成の隙間が原理的に無い
+   - モデル（whisper-base 約80MB）は初回のみダウンロードされブラウザにキャッシュ。
+     推論は端末内（WebGPU、無ければWASM）。外部の認識APIは一切呼ばない＝利用料ゼロ */
+var engine='sr';               // 'sr'（Web Speech）| 'wh'（ローカルAI）
+try{ if(localStorage.getItem('lt_engine')==='wh') engine='wh'; }catch(e){}
+var WH_SR=16000;
+var wh={pipe:null, loading:false, dev:'', stream:null, ctx:null, proc:null, gain0:null,
+        buf:[], rmsArr:[], bufLen:0, speechMs:0, silenceMs:0, floor:0.006,
+        queue:[], busy:false, running:false, srcKind:'mic'};
+try{ if(localStorage.getItem('lt_whsrc')==='tab') wh.srcKind='tab'; }catch(e){}
+function whDiag(m){ diag('[wh] '+m); }
+function whLoadModel(){
+  if(wh.pipe) return Promise.resolve(wh.pipe);
+  if(wh.loading) return Promise.reject(new Error('loading'));
+  wh.loading=true;
+  setStatus('ローカルAIモデルを準備中…（初回のみ約80MBをダウンロード。2回目からは即起動）');
+  return import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6/dist/transformers.min.js')
+    .then(function(mod){
+      var devP = (navigator.gpu && navigator.gpu.requestAdapter)
+        ? navigator.gpu.requestAdapter().then(function(a){return a?'webgpu':'wasm';}).catch(function(){return 'wasm';})
+        : Promise.resolve('wasm');
+      return devP.then(function(dev){
+        var opts = dev==='webgpu'
+          ? {device:'webgpu', dtype:{encoder_model:'fp32', decoder_model_merged:'q4'}}
+          : {device:'wasm', dtype:'q8'};
+        opts.progress_callback=function(p){
+          if(p && p.status==='progress' && typeof p.progress==='number' && /onnx/.test(p.file||''))
+            setStatus('AIモデル取得中 '+Math.round(p.progress)+'%（初回のみ）');
+        };
+        return mod.pipeline('automatic-speech-recognition','onnx-community/whisper-base',opts)
+          .catch(function(e){
+            whDiag('primary model failed: '+String(e&&e.message||e).slice(0,80));
+            return mod.pipeline('automatic-speech-recognition','Xenova/whisper-base',{device:dev,dtype:'q8'});
+          })
+          .then(function(pipe){ wh.pipe=pipe; wh.dev=dev; whDiag('model ready ('+dev+')'); return pipe; });
+      });
+    })
+    .then(function(p){ wh.loading=false; return p; },
+          function(e){ wh.loading=false; throw e; });
+}
+function whGetStream(){
+  if(window.__whInjectStream) return Promise.resolve(window.__whInjectStream);   // 無音E2E検証用の注入口
+  if(wh.srcKind==='tab'){
+    return navigator.mediaDevices.getDisplayMedia({video:true,audio:true}).then(function(ds){
+      ds.getVideoTracks().forEach(function(t){t.enabled=false;});   // 映像は使わない（stopすると共有ごと終わる環境があるため無効化のみ）
+      if(!ds.getAudioTracks().length){
+        ds.getTracks().forEach(function(t){t.stop();});
+        throw new Error('no-audio-share');
+      }
+      return ds;
+    });
+  }
+  return navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+}
+function whResetCollect(){ wh.buf=[]; wh.rmsArr=[]; wh.bufLen=0; wh.speechMs=0; wh.silenceMs=0; }
+function whCutSegment(force){
+  if(wh.speechMs<400){ whResetCollect(); return; }        // 音声なし区間は推論しない（幻聴防止・省電力）
+  var frames=wh.buf, rms=wh.rmsArr, cutIdx=frames.length;
+  if(force && frames.length>14){
+    /* 15秒強制カット: 末尾3秒でいちばん静かなフレームで切り、残りは次セグメントへ持ち越す */
+    var from=frames.length-12, best=from, bv=1e9;
+    for(var i=from;i<frames.length;i++){ if(rms[i]<bv){bv=rms[i];best=i;} }
+    cutIdx=best;
+  }
+  var len=0,i;
+  for(i=0;i<cutIdx;i++)len+=frames[i].length;
+  var seg=new Float32Array(len), off=0;
+  for(i=0;i<cutIdx;i++){ seg.set(frames[i],off); off+=frames[i].length; }
+  var rest=frames.slice(cutIdx), restRms=rms.slice(cutIdx);
+  whResetCollect();
+  wh.buf=rest; wh.rmsArr=restRms;
+  for(i=0;i<rest.length;i++)wh.bufLen+=rest[i].length;
+  wh.queue.push(seg);
+  whPump();
+}
+var WH_HALLU=[/^ご視聴ありがとうございました[。.]?$/,/^ありがとうございました[。.]?$/,
+  /^thank you[.!]?$/i,/^thanks for watching[.!]?$/i,/^\[?blank[_ ]?audio\]?$/i,/^[\s.。、,!?！？♪()（）\-]*$/];
+function whIsHallu(t){
+  var x=t.trim();
+  for(var i=0;i<WH_HALLU.length;i++)if(WH_HALLU[i].test(x))return true;
+  return false;
+}
+function whPump(){
+  if(wh.busy || !wh.pipe) return;    // モデル準備前はキューに溜める（音は失わない）
+  var item=wh.queue.shift();
+  if(!item) return;
+  wh.busy=true;
+  if(wh.queue.length>=1) setStatus('AI認識中…（待ち '+wh.queue.length+'件）');
+  var t0=Date.now();
+  wh.pipe(item,{language: lang==='ja'?'japanese':'english', task:'transcribe'})
+    .then(function(out){
+      var txt=((out&&out.text)||'').trim();
+      whDiag('seg '+(item.length/WH_SR).toFixed(1)+'s -> '+(Date.now()-t0)+'ms '+txt.length+'ch q='+wh.queue.length);
+      if(txt && !whIsHallu(txt)) commitChunk(txt);
+      render();
+    })
+    .catch(function(e){ whDiag('infer error '+String(e&&e.message||e).slice(0,80)); })
+    .then(function(){
+      wh.busy=false;
+      if(wh.queue.length) whPump();
+      else if(wh.running) setStatus('聞き取り中…（ローカルAI・'+wh.dev+(wh.srcKind==='tab'?'・タブ音声':'・マイク')+'）');
+    });
+}
+function whStart(){
+  /* 順序が重要: getDisplayMedia はクリック直後の user activation が必要なので
+     ストリーム取得を先に行い、モデルロードは後追い（ロード中の音声もバッファへ溜まる） */
+  whGetStream().then(function(st){
+      if(!running){ try{st.getTracks().forEach(function(t){t.stop();});}catch(e){} return; }
+      wh.stream=st;
+      var AC=window.AudioContext||window.webkitAudioContext;
+      wh.ctx=new AC({sampleRate:WH_SR});
+      if(wh.ctx.state==='suspended'){ try{wh.ctx.resume();}catch(e){} }
+      var srcN=wh.ctx.createMediaStreamSource(st);
+      wh.proc=wh.ctx.createScriptProcessor(4096,1,1);
+      wh.gain0=wh.ctx.createGain(); wh.gain0.gain.value=0;  // 出力へは無音（エコー・二重再生防止）
+      srcN.connect(wh.proc); wh.proc.connect(wh.gain0); wh.gain0.connect(wh.ctx.destination);
+      whResetCollect();
+      wh.running=true;
+      wh.proc.onaudioprocess=function(ev){
+        if(!wh.running) return;
+        var ch=ev.inputBuffer.getChannelData(0);
+        var f32=new Float32Array(ch);
+        var s=0; for(var i=0;i<f32.length;i++)s+=f32[i]*f32[i];
+        var r=Math.sqrt(s/f32.length);
+        wh.buf.push(f32); wh.rmsArr.push(r); wh.bufLen+=f32.length;
+        if(r<wh.floor) wh.floor=wh.floor*0.8+r*0.2; else wh.floor=Math.min(0.02, wh.floor*1.001);
+        var frameMs=f32.length/WH_SR*1000;
+        if(r>Math.max(0.008, wh.floor*3)){ wh.speechMs+=frameMs; wh.silenceMs=0; }
+        else wh.silenceMs+=frameMs;
+        var durMs=wh.bufLen/WH_SR*1000;
+        if(wh.speechMs>=600 && wh.silenceMs>=700 && durMs>=1500) whCutSegment(false);
+        else if(durMs>=15000) whCutSegment(true);
+        else if(wh.speechMs===0 && durMs>=6000){
+          /* 純無音が続く: 直近1フレームだけ残して捨てる（メモリと幻聴の抑制） */
+          var last=wh.buf[wh.buf.length-1], lr=wh.rmsArr[wh.rmsArr.length-1];
+          wh.buf=[last]; wh.rmsArr=[lr]; wh.bufLen=last.length;
+        }
+      };
+      diag('wh capture on ('+wh.srcKind+')');
+      if(wh.pipe) setStatus('聞き取り中…（ローカルAI・'+wh.dev+(wh.srcKind==='tab'?'・タブ音声':'・マイク')+'）');
+      else setStatus('音声の取り込みを開始しました（AIモデルを準備中…この間の音声も溜めています）');
+      /* タブ音声モード: 録音は同じストリームから取る */
+      if(recTgl.checked && wh.srcKind==='tab') startRecording(new MediaStream(st.getAudioTracks()));
+      else if(recTgl.checked) startRecording();
+      /* モデルは後追いロード（初回のみDL）。準備でき次第、溜まったキューを流す */
+      return whLoadModel().then(function(){
+        if(wh.running) setStatus('聞き取り中…（ローカルAI・'+wh.dev+(wh.srcKind==='tab'?'・タブ音声':'・マイク')+'）');
+        whPump();
+      });
+  }).catch(function(e){
+    var msg=String(e&&e.message||e);
+    diag('wh start failed: '+msg.slice(0,80));
+    running=false; wh.running=false; keepAwake(false); refreshUI();
+    if(msg==='no-audio-share')
+      setStatus('音声が共有されませんでした。共有ダイアログで「タブ」を選び「音声も共有」にチェックを入れてください');
+    else if(/NotAllowed/i.test(msg))
+      setStatus('共有/マイクが許可されませんでした。もう一度「開始」からやり直してください');
+    else
+      setStatus('ローカルAIの準備に失敗しました（'+msg.slice(0,40)+'）。「標準」エンジンをお使いください');
+  });
+}
+function whStop(){
+  wh.running=false;
+  /* 停止時点までの残りバッファも最後のセグメントとして認識に回す（取りこぼさない） */
+  try{ if(wh.speechMs>=400) whCutSegment(false); }catch(e){}
+  try{ if(wh.proc)wh.proc.disconnect(); }catch(e){}
+  try{ if(wh.gain0)wh.gain0.disconnect(); }catch(e){}
+  try{ if(wh.stream && wh.stream!==window.__whInjectStream) wh.stream.getTracks().forEach(function(t){t.stop();}); }catch(e){}
+  try{ if(wh.ctx)wh.ctx.close(); }catch(e){}
+  wh.proc=null; wh.gain0=null; wh.stream=null; wh.ctx=null;
+  whResetCollect();
+}
+
 /* ---- UI ---- */
 mainBtn.addEventListener('click',function(){
-  if(!SR){setStatus('このブラウザは音声認識に未対応です。iPhone の Safari で開いてください');return;}
+  if(engine==='sr' && !SR){setStatus('このブラウザは音声認識に未対応です。「ローカルAI」エンジンをお試しください');return;}
   if(running){
     copyNow();                      // 停止タップと同時に全文をコピー
     running=false;
-    clearTimeout(restartTimer);
-    stopWatchdog();
-    stopMonitor();
-    try{rec&&rec.stop();}catch(e){}
+    if(engine==='wh'){
+      whStop();
+    }else{
+      clearTimeout(restartTimer);
+      stopWatchdog();
+      stopMonitor();
+      try{rec&&rec.stop();}catch(e){}
+    }
     stopRecording();
     prevDur=elapsedSec(); takeStart=0;
     keepAwake(false);
@@ -628,12 +819,16 @@ mainBtn.addEventListener('click',function(){
   }else{
     running=true;
     everStarted=true;
-    abortStreak=0; consecFail=0; zeroSessions=0; rotationsThisRun=0;
     if(segs.length===0)prevDur=0;
     takeStart=Date.now();
-    setStatus('聞き取り中…');
     keepAwake(true);
     refreshUI();
+    if(engine==='wh'){
+      whStart();                    // 準備（モデル・音声ソース）が整い次第、連続認識に入る
+      return;
+    }
+    abortStreak=0; consecFail=0; zeroSessions=0; rotationsThisRun=0;
+    setStatus('聞き取り中…');
     sessionStartedAt=Date.now(); lastResultAt=Date.now();
     startWatchdog();
     startMonitor();                 // v13: 音量監視（死んだセッションの即検知・切れ目ローテ用）
@@ -645,6 +840,38 @@ mainBtn.addEventListener('click',function(){
     }
   }
 });
+/* エンジン・音声ソースの切替（停止中のみ） */
+var engSR=document.getElementById('engSR'), engWH=document.getElementById('engWH'),
+    srcSeg=document.getElementById('srcSeg'),
+    srcMic=document.getElementById('srcMic'), srcTab=document.getElementById('srcTab');
+function refreshEngineUI(){
+  engSR.classList.toggle('on',engine==='sr');
+  engWH.classList.toggle('on',engine==='wh');
+  srcSeg.style.display = engine==='wh' ? '' : 'none';
+  srcMic.classList.toggle('on',wh.srcKind==='mic');
+  srcTab.classList.toggle('on',wh.srcKind==='tab');
+}
+function setEngine(e2){
+  if(running){setStatus('停止してからエンジンを切り替えてください');return;}
+  engine=e2;
+  try{localStorage.setItem('lt_engine',e2);}catch(e){}
+  refreshEngineUI();
+  setStatus(e2==='wh'
+    ? 'ローカルAI: 端末内で認識します（初回のみモデル取得）。テレカンは「タブ音声」推奨'
+    : '標準エンジン（ブラウザの音声認識）');
+}
+engSR.addEventListener('click',function(){setEngine('sr');});
+engWH.addEventListener('click',function(){setEngine('wh');});
+srcMic.addEventListener('click',function(){
+  if(running){setStatus('停止してから切り替えてください');return;}
+  wh.srcKind='mic'; try{localStorage.setItem('lt_whsrc','mic');}catch(e){} refreshEngineUI();
+});
+srcTab.addEventListener('click',function(){
+  if(running){setStatus('停止してから切り替えてください');return;}
+  wh.srcKind='tab'; try{localStorage.setItem('lt_whsrc','tab');}catch(e){} refreshEngineUI();
+  setStatus('タブ音声: 開始時に共有ダイアログが出ます。テレカンのタブを選び「音声も共有」にチェック');
+});
+refreshEngineUI();
 document.getElementById('copyBtn').addEventListener('click',copyNow);
 document.getElementById('clearBtn').addEventListener('click',function(){
   committed=interim=transDone=transInterim='';
@@ -698,7 +925,41 @@ if(SR){
 }
 document.getElementById('ver').textContent=V;
 try{window.__diag=diagBuf; window.__ver=V;}catch(e){}   // リモート診断用の読み取り窓
-if(!SR){setStatus('このブラウザは音声認識に未対応です。iPhone の Safari で開いてください');}
+/* 無音E2E検証用フック（スピーカーを一切鳴らさずにローカルAI経路を検証する）
+   __whTest(url): 音声ファイルを直接推論して文字列を返す
+   __whMakeStream(url): 音声ファイルを内部ストリーム化して注入（開始を押すと本経路で流れる） */
+try{
+  window.__whTest=function(url){
+    return whLoadModel().then(function(){ return fetch(url); })
+      .then(function(r){ return r.arrayBuffer(); })
+      .then(function(ab){
+        var AC=window.AudioContext||window.webkitAudioContext;
+        var c=new AC({sampleRate:WH_SR});
+        return c.decodeAudioData(ab).then(function(b){
+          var d=b.getChannelData(0);
+          return wh.pipe(d,{language:'english',task:'transcribe'}).then(function(o){
+            try{c.close();}catch(e){}
+            return o.text;
+          });
+        });
+      });
+  };
+  window.__whMakeStream=function(url){
+    return fetch(url).then(function(r){return r.arrayBuffer();}).then(function(ab){
+      var AC=window.AudioContext||window.webkitAudioContext;
+      var c=new AC();
+      if(c.state==='suspended'){try{c.resume();}catch(e){}}
+      var dest=c.createMediaStreamDestination();
+      return c.decodeAudioData(ab).then(function(b){
+        var s=c.createBufferSource(); s.buffer=b; s.connect(dest); s.start();
+        window.__whInjectStream=dest.stream;
+        window.__whInjectCtx=c;
+        return 'stream ready dur='+b.duration.toFixed(1)+'s';
+      });
+    });
+  };
+}catch(e){}
+if(!SR && engine==='sr'){setStatus('このブラウザは標準音声認識に未対応です。「ローカルAI」をお使いください');}
 else{setStatus('「開始」を押してください（'+V+'）');}
 render();
 refreshUI();
